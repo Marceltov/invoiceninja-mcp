@@ -16,9 +16,19 @@
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import base64
+import os
+import sys
+import traceback
 from contextvars import ContextVar
+from pathlib import Path
 
 import httpx
+import uvicorn
+import yaml
+from fastmcp import FastMCP
+from fastmcp.server.providers.openapi import MCPType, RouteMap
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
 
 # All configuration comes from the environment so the server runs cleanly as a
 # container sidecar with no command-line arguments.
@@ -109,3 +119,205 @@ class TokenCaptureMiddleware:
             await self.app(scope, receive, send)
         finally:
             _incoming_auth.reset(token)
+
+
+# The InvoiceNinja OpenAPI spec ships alongside this server (baked into the
+# image). Tools are generated from it at startup.
+DEFAULT_SPEC = Path(__file__).parent / "invoiceninja-api-docs.yaml"
+
+
+def _stringify_keys(obj):
+    """Recursively coerce dict keys to strings.
+
+    OpenAPI is a JSON format (JSON only has string keys), but this spec is
+    authored as YAML, and YAML's default resolver parses unquoted numeric
+    map keys -- e.g. the `200:`/`401:`/... status codes under `responses` --
+    as ints rather than strings. The OpenAPI/pydantic validator FastMCP uses
+    requires string keys, so we normalize back to JSON's key model here.
+    """
+    if isinstance(obj, dict):
+        return {str(k): _stringify_keys(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_stringify_keys(v) for v in obj]
+    return obj
+
+
+def load_spec(spec_path: Path) -> dict:
+    """Parse the on-disk InvoiceNinja OpenAPI spec into a dict.
+
+    The spec ships as YAML; because YAML is a superset of JSON this also
+    parses a JSON spec, so the file can be swapped for either format.
+    """
+    if not spec_path.exists():
+        raise RuntimeError(f"OpenAPI spec not found at {spec_path}.")
+    text = spec_path.read_text()
+    if not text.strip():
+        raise RuntimeError(
+            f"OpenAPI spec at {spec_path} is empty -- populate it with the "
+            f"InvoiceNinja OpenAPI spec."
+        )
+    spec = yaml.safe_load(text)
+    if not isinstance(spec, dict):
+        raise RuntimeError(f"OpenAPI spec at {spec_path} is not a valid mapping.")
+    return _stringify_keys(spec)
+
+
+def register_health(mcp: FastMCP) -> None:
+    """Add an unauthenticated health endpoint for container healthchecks."""
+
+    @mcp.custom_route(HEALTH_PATH, methods=["GET"])
+    async def health(_request: Request):
+        return PlainTextResponse("ok")
+
+
+def register_upload_client_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None:
+    """Register a working replacement for the generated uploadClient tool.
+
+    `POST /clients/{id}/upload` takes a multipart/form-data body with a
+    `documents[]` array of binary files (OpenAPI `type: string, format:
+    binary` items). FastMCP's OpenAPI-generated tool has no JSON-representable
+    way to accept real file bytes from an MCP client, so we exclude it (see
+    build_server's route_maps) and register a tool that takes base64-encoded
+    file contents instead and builds the multipart request ourselves. The
+    `client` carries the same per-request auth as the generated tools (see
+    InvoiceNinjaTokenAuth).
+    """
+
+    @mcp.tool(name="uploadClient")
+    async def upload_client(id: str, filename: str, content_base64: str) -> str:
+        """Upload a document to a client.
+
+        `content_base64` is the file's contents, base64-encoded. `filename`
+        is the name to store it under; InvoiceNinja infers the file type from
+        its extension.
+        """
+        file_bytes = base64.b64decode(content_base64)
+        response = await client.post(
+            f"/api/v1/clients/{id}/upload",
+            files={"documents[]": (filename, file_bytes)},
+        )
+        response.raise_for_status()
+        return f"Uploaded {filename!r} to client {id!r}."
+
+
+def build_server(client: httpx.AsyncClient | None = None) -> FastMCP:
+    """Load the local OpenAPI spec and turn every documented InvoiceNinja
+    endpoint into a FastMCP tool. The API token is supplied per request by the
+    client (see TokenCaptureMiddleware / InvoiceNinjaTokenAuth), so no token
+    is read here.
+
+    `client` is injectable for testing; in production the default client
+    targets INVOICENINJA_SERVER_URL and authenticates from the per-request
+    contextvar.
+    """
+    if client is None:
+        # No /api/v1 suffix here: unlike trillium-mcp's ETAPI spec (whose
+        # path keys are relative, e.g. "/notes/{id}", with "/etapi" carried
+        # only by the base URL), InvoiceNinja's spec path keys already
+        # include the full "/api/v1/..." prefix (e.g. "/api/v1/clients").
+        # httpx's base_url + relative-path concatenation would double it up
+        # to "/api/v1/api/v1/clients" if we appended it here too.
+        server_url = os.environ.get(SERVER_ENV, DEFAULT_SERVER_URL).rstrip("/")
+        client = httpx.AsyncClient(
+            base_url=server_url, auth=InvoiceNinjaTokenAuth(), timeout=60
+        )
+
+    spec_path = Path(os.environ.get(SPEC_ENV, str(DEFAULT_SPEC)))
+    spec = load_spec(spec_path)
+
+    # login/logout manage InvoiceNinja session tokens, but an MCP client
+    # already authenticates via the Authorization header -- an LLM has no
+    # reason to mint a token from a password, and calling logout would
+    # invalidate its own credential. uploadClient is excluded and replaced
+    # because FastMCP can't express real binary file bytes in its JSON
+    # tool schema (see register_upload_client_tool).
+    mcp = FastMCP.from_openapi(
+        openapi_spec=spec,
+        client=client,
+        name="InvoiceNinja MCP",
+        route_maps=[
+            RouteMap(
+                methods=["POST"],
+                pattern=r"/(login|logout)$",
+                mcp_type=MCPType.EXCLUDE,
+            ),
+            RouteMap(
+                methods=["POST"],
+                pattern=r"/clients/\{id\}/upload$",
+                mcp_type=MCPType.EXCLUDE,
+            ),
+        ],
+    )
+    register_upload_client_tool(mcp, client)
+    register_health(mcp)
+    return mcp
+
+
+def build_error_server(error: BaseException) -> FastMCP:
+    """Stand-in MCP server that reports a startup failure over a live
+    connection instead of dying with an opaque error. Only reachable if the
+    bundled OpenAPI spec is missing or unparseable.
+    """
+    summary = str(error).strip() or error.__class__.__name__
+    detail = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    ).strip()
+    instructions = (
+        f"This InvoiceNinja MCP server FAILED TO START and exposes no "
+        f"InvoiceNinja tools.\n\nReason: {summary}\n\nThe bundled OpenAPI spec "
+        f"could not be loaded. Call the `startup_error` tool for the full error."
+    )
+    mcp = FastMCP(
+        name="InvoiceNinja MCP (startup failed)",
+        instructions=instructions,
+    )
+    register_health(mcp)
+
+    @mcp.tool
+    def startup_error() -> str:
+        """Explain why this InvoiceNinja MCP server failed to start."""
+        return (
+            "The InvoiceNinja MCP server failed to start, so no InvoiceNinja "
+            f"tools are available.\n\n--- Full error ---\n{detail}"
+        )
+
+    return mcp
+
+
+def serve(mcp: FastMCP) -> None:
+    """Serve an MCP server over streamable HTTP behind the token-capture
+    middleware, using the MCP_* environment configuration."""
+    host = os.environ.get(MCP_HOST_ENV, DEFAULT_HOST)
+    port = int(os.environ.get(MCP_PORT_ENV, DEFAULT_PORT))
+    path = os.environ.get(MCP_PATH_ENV, DEFAULT_PATH)
+
+    allowed = os.environ.get(MCP_ALLOWED_HOSTS_ENV, "").strip()
+    if allowed:
+        hosts = [h.strip() for h in allowed.split(",") if h.strip()]
+        inner = mcp.http_app(path=path, allowed_hosts=hosts)
+        print(f"Host protection ON; allowed hosts (plus localhost): {hosts}",
+              file=sys.stderr)
+    else:
+        inner = mcp.http_app(path=path, host_origin_protection=False)
+        print(f"Host protection OFF (any Host accepted) -- set "
+              f"{MCP_ALLOWED_HOSTS_ENV} to restrict.", file=sys.stderr)
+    app = TokenCaptureMiddleware(inner)
+
+    print(f"Serving InvoiceNinja MCP on http://{host}:{port}{path} "
+          f"(client supplies the API token via the Authorization header)",
+          file=sys.stderr)
+    uvicorn.run(app, host=host, port=port)
+
+
+def main():
+    try:
+        mcp = build_server()
+    except Exception as e:
+        print(f"Error: failed to build InvoiceNinja MCP server: {e}",
+              file=sys.stderr)
+        mcp = build_error_server(e)
+    serve(mcp)
+
+
+if __name__ == "__main__":
+    main()
