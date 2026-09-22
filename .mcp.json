@@ -1,0 +1,1 @@
+{ "mcpServers": { "invoiceninja": { "type": "http", "url": "https://your-host/mcp", "headers": { "Authorization": "YOUR_INVOICENINJA_API_TOKEN" } } } }
