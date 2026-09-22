@@ -91,6 +91,12 @@ def test_upload_client_sends_multipart_with_decoded_bytes():
     assert captured["content_type"].startswith("multipart/form-data")
     assert b"hello world" in captured["body"]
     assert b"note.txt" in captured["body"]
+    # InvoiceNinja registers this route as PUT, not the POST the OpenAPI spec
+    # documents -- and PHP/Symfony don't parse multipart bodies on a raw PUT
+    # request, so the request must be a POST carrying Laravel's method-
+    # spoofing field to actually land as a PUT server-side.
+    assert b'name="_method"' in captured["body"]
+    assert b"PUT" in captured["body"]
 
 
 def test_get_clients_works_through_generated_tool():

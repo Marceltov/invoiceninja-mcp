@@ -173,10 +173,15 @@ def register_health(mcp: FastMCP) -> None:
 def register_upload_client_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None:
     """Register a working replacement for the generated uploadClient tool.
 
-    `POST /clients/{id}/upload` takes a multipart/form-data body with a
-    `documents[]` array of binary files (OpenAPI `type: string, format:
-    binary` items). FastMCP's OpenAPI-generated tool has no JSON-representable
-    way to accept real file bytes from an MCP client, so we exclude it (see
+    The OpenAPI spec documents this as `POST /clients/{id}/upload`, but
+    InvoiceNinja actually registers it (and every other `/{id}/upload` route)
+    as PUT -- confirmed via `php artisan route:list` against a real instance.
+    A raw PUT with a multipart/form-data body doesn't work either: PHP/Symfony
+    only parse multipart bodies for POST requests, so a bare PUT upload is
+    silently dropped (302, not even an error). The fix is Laravel's method-
+    spoofing convention: send a POST with a `_method=PUT` field alongside the
+    file. FastMCP's OpenAPI-generated tool also has no JSON-representable way
+    to accept real file bytes from an MCP client, so we exclude it (see
     build_server's route_maps) and register a tool that takes base64-encoded
     file contents instead and builds the multipart request ourselves. The
     `client` carries the same per-request auth as the generated tools (see
@@ -194,7 +199,10 @@ def register_upload_client_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None
         file_bytes = base64.b64decode(content_base64)
         response = await client.post(
             f"/api/v1/clients/{id}/upload",
-            files={"documents[]": (filename, file_bytes)},
+            files={
+                "documents[]": (filename, file_bytes),
+                "_method": (None, "PUT"),
+            },
         )
         response.raise_for_status()
         return f"Uploaded {filename!r} to client {id!r}."
