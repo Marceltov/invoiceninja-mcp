@@ -151,6 +151,108 @@ def _stringify_keys(obj):
     return obj
 
 
+# operationId -> components/schemas name, for write operations the upstream
+# spec documents with no requestBody at all (see _patch_missing_request_bodies).
+# Each schema name was chosen to match the sibling operation on the same
+# resource that *does* document a body (e.g. updateInvoice takes the same
+# InvoiceRequest storeInvoice does; updateCompany/storeCompany have no such
+# sibling anywhere, so both fall back to the plain response schema, Company,
+# the same way the spec's own storePaymentTerm/storeTaskStatus do).
+_MISSING_REQUEST_BODY_SCHEMAS = {
+    "storeBankIntegration": "BankIntegration",
+    "updateBankIntegration": "BankIntegration",
+    "storeBankTransaction": "BankTransaction",
+    "updateBankTransaction": "BankTransaction",
+    "storeBankTransactionRule": "BankTransactionRule",
+    "updateBankTransactionRule": "BankTransactionRule",
+    "storeClientGatewayToken": "ClientGatewayToken",
+    "updateClientGatewayToken": "ClientGatewayToken",
+    "storeCompany": "Company",
+    "updateCompany": "Company",
+    "storeCompanyGateway": "CompanyGateway",
+    "updateCompanyGateway": "CompanyGateway",
+    "updateCompanyUser": "CompanyUser",
+    "storeDesign": "Design",
+    "updateDesign": "Design",
+    "storeExpenseCategory": "ExpenseCategory",
+    "updateExpenseCategory": "ExpenseCategory",
+    "storeExpense": "Expense",
+    "updateExpense": "Expense",
+    "storeGroupSetting": "GroupSetting",
+    "updateGroupSetting": "GroupSetting",
+    "updatePaymentTerm": "PaymentTerm",
+    "storeRecurringExpense": "RecurringExpense",
+    "updateRecurringExpense": "RecurringExpense",
+    "storeRecurringQuote": "RecurringQuote",
+    "updateRecurringQuote": "RecurringQuote",
+    "storeSubscription": "Subscription",
+    "updateSubscription": "Subscription",
+    "updateTaskStatus": "TaskStatus",
+    "updateTaxRate": "TaxRate",
+    "storeToken": "CompanyToken",
+    "updateToken": "CompanyToken",
+    "storeUser": "User",
+    "updateUser": "User",
+    "storeWebhook": "Webhook",
+    "updateWebhook": "Webhook",
+    "updateCredit": "CreditRequest",
+    "updateRecurringInvoice": "RecurringInvoiceRequest",
+    "updateInvoice": "InvoiceRequest",
+    "updatePayment": "PaymentRequest",
+}
+
+
+def _patch_missing_request_bodies(spec: dict) -> None:
+    """Fill in the requestBody the upstream spec omits for ~40 core CRUD
+    write endpoints (companies, invoices, payments, users, webhooks, ...).
+
+    Without this, FastMCP.from_openapi still generates a tool for e.g.
+    `updateCompany` or `updateInvoice` -- it just has no body parameters at
+    all, so calls silently no-op (200 OK, nothing changed) with no error to
+    signal why. Verified by diffing every POST/PUT/PATCH operation in the
+    bundled spec against whether it declares a requestBody: 40 CRUD
+    operations don't, where a sibling operation on the same resource (or an
+    equivalent resource, e.g. PaymentTerm/TaskStatus's own store operations)
+    proves what shape the body should be. The remaining ~29 bodyless
+    POST operations (refresh, webhooks, migration, self-update, invites,
+    ...) are left untouched: those are genuinely parameterless actions, not
+    another instance of this bug.
+
+    Applied in-memory to the parsed spec after every load (see load_spec),
+    not as an edit to the YAML file, because that file is periodically
+    re-fetched from upstream and would silently drop a hand-edit on the next
+    refresh. Each operationId is patched only if it's still missing a
+    requestBody and its target schema still exists, so this is a no-op (not
+    an error) if upstream ever documents these properly or renames a schema.
+    """
+    schemas = spec.get("components", {}).get("schemas", {})
+    for methods in spec.get("paths", {}).values():
+        if not isinstance(methods, dict):
+            continue
+        for op in methods.values():
+            if not isinstance(op, dict):
+                continue
+            operation_id = op.get("operationId")
+            schema_name = _MISSING_REQUEST_BODY_SCHEMAS.get(operation_id)
+            if schema_name is None or "requestBody" in op:
+                continue
+            if schema_name not in schemas:
+                print(
+                    f"Warning: skipping requestBody patch for {operation_id!r} "
+                    f"-- schema {schema_name!r} no longer exists in the spec.",
+                    file=sys.stderr,
+                )
+                continue
+            op["requestBody"] = {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": f"#/components/schemas/{schema_name}"}
+                    }
+                },
+            }
+
+
 def load_spec(spec_path: Path) -> dict:
     """Parse the on-disk InvoiceNinja OpenAPI spec into a dict.
 
@@ -168,7 +270,9 @@ def load_spec(spec_path: Path) -> dict:
     spec = yaml.safe_load(text)
     if not isinstance(spec, dict):
         raise RuntimeError(f"OpenAPI spec at {spec_path} is not a valid mapping.")
-    return _stringify_keys(spec)
+    spec = _stringify_keys(spec)
+    _patch_missing_request_bodies(spec)
+    return spec
 
 
 def register_health(mcp: FastMCP) -> None:
