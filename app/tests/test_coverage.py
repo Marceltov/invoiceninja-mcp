@@ -20,8 +20,11 @@ _SPEC = _HERE.parents[1] / "invoiceninja-api-docs.yaml"  # app/invoiceninja-api-
 
 # Endpoints intentionally NOT exposed as MCP tools, so they are not tested.
 # login/logout manage InvoiceNinja session tokens; excluded in server.py via
-# a RouteMap (see the build_server comment).
-_EXCLUDED_OPERATIONS = {"login", "logout"}
+# a RouteMap (see the build_server comment). FastMCP names generated tools
+# after their spec operationId, which for these two routes is postLogin and
+# getLogout (not "login"/"logout" -- confirm with `grep operationId` near
+# those paths in the spec if this ever needs re-checking).
+_EXCLUDED_OPERATIONS = {"postLogin", "getLogout"}
 
 # The slice of the 365-operation surface this plan live-tests. Expand this
 # set (and add a matching live test under tests/live/) as coverage grows.
@@ -82,11 +85,5 @@ def test_no_unknown_tool_names_referenced():
 
 def test_tested_operations_are_real_spec_operations():
     operations = _spec_operation_ids()
-    bogus = sorted(_TESTED_OPERATIONS - operations - {"getClients"} | (
-        {"getClients"} - operations
-    ))
-    # (getClients is checked separately since it's a GET list endpoint some
-    # spec revisions name differently; fail loudly either way if missing.)
-    assert "getClients" in operations, "getClients missing from the spec -- name may have changed upstream"
     missing = sorted(_TESTED_OPERATIONS - operations)
     assert not missing, f"TESTED_OPERATIONS lists operationIds not in the spec: {missing}"
