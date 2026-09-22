@@ -141,6 +141,56 @@ def test_load_spec_non_mapping_raises(tmp_path):
         server.load_spec(bad)
 
 
+def test_patch_missing_request_bodies_fills_known_gap():
+    # updateCompany is one of the ~40 operations the bundled spec documents
+    # with no requestBody at all (see _patch_missing_request_bodies); assert
+    # against the real spec so this catches upstream ever fixing it too.
+    spec = server.load_spec(server.DEFAULT_SPEC)
+    op = spec["paths"]["/api/v1/companies/{id}"]["put"]
+    assert op["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/Company"
+    }
+
+
+def test_patch_missing_request_bodies_is_idempotent():
+    spec = {
+        "components": {"schemas": {"Widget": {}}},
+        "paths": {"/widgets": {"put": {"operationId": "updateWidget"}}},
+    }
+    server._MISSING_REQUEST_BODY_SCHEMAS["updateWidget"] = "Widget"
+    try:
+        server._patch_missing_request_bodies(spec)
+        first = spec["paths"]["/widgets"]["put"]["requestBody"]
+        server._patch_missing_request_bodies(spec)
+        assert spec["paths"]["/widgets"]["put"]["requestBody"] == first
+    finally:
+        del server._MISSING_REQUEST_BODY_SCHEMAS["updateWidget"]
+
+
+def test_patch_missing_request_bodies_skips_unknown_schema(capsys):
+    spec = {
+        "components": {"schemas": {}},
+        "paths": {"/widgets": {"put": {"operationId": "updateWidget"}}},
+    }
+    server._MISSING_REQUEST_BODY_SCHEMAS["updateWidget"] = "NoSuchSchema"
+    try:
+        server._patch_missing_request_bodies(spec)
+        assert "requestBody" not in spec["paths"]["/widgets"]["put"]
+        assert "NoSuchSchema" in capsys.readouterr().err
+    finally:
+        del server._MISSING_REQUEST_BODY_SCHEMAS["updateWidget"]
+
+
+def test_update_company_tool_exposes_body_parameters():
+    # Regression test for the bug this was written to fix: without the
+    # requestBody patch, updateCompany's generated tool had no way to send
+    # any company fields at all, so calls silently no-op'd.
+    mcp = server.build_server()
+    tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+    props = tools["updateCompany"].parameters["properties"]
+    assert "settings" in props
+
+
 def test_build_error_server_exposes_startup_error_tool():
     import asyncio
 
