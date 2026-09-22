@@ -1,0 +1,114 @@
+# Running `docker compose up -d --build` starts a throwaway InvoiceNinja
+# instance (app + nginx + mysql + redis) plus the MCP server built from local
+# source. Unlike trillium-mcp's single-container fixture, self-hosted
+# InvoiceNinja needs this many services; see CONTRIBUTING.md.
+services:
+  app:
+    image: invoiceninja/invoiceninja-debian:latest
+    restart: unless-stopped
+    environment:
+      # -- Dev-fixture credentials, committed and disposable. Never reuse
+      # these anywhere real. --
+      APP_URL: http://localhost:8082
+      APP_KEY: base64:jUstJoF2xxlFc71lZFLttlZ8x4408SV8tnLlpNNcYcU=
+      APP_ENV: production
+      APP_DEBUG: "true"
+      REQUIRE_HTTPS: "false"
+      PDF_GENERATOR: snappdf
+      TRUSTED_PROXIES: '*'
+      CACHE_DRIVER: redis
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: redis
+      REDIS_HOST: redis
+      REDIS_PASSWORD: "null"
+      REDIS_PORT: "6379"
+      FILESYSTEM_DISK: debian_docker
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_DATABASE: ninja
+      DB_USERNAME: ninja
+      DB_PASSWORD: ninja
+      # Auto-creates the admin company/user on first boot (see
+      # scripts/mint_dev_token.py, which logs in as this user).
+      IN_USER_EMAIL: admin@example.com
+      IN_PASSWORD: invoiceninja-mcp-dev
+      MAIL_MAILER: log
+      IS_DOCKER: "true"
+      SCOUT_DRIVER: "null"
+    volumes:
+      - app_public:/var/www/html/public
+      - app_storage:/var/www/html/storage
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Public-facing webserver, named to match INVOICENINJA_SERVER_URL's default
+  # (http://invoiceninja:80) so the MCP server needs no override in this stack.
+  invoiceninja:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "8082:80"
+    volumes:
+      - ./nginx:/etc/nginx/conf.d:ro
+      - app_public:/var/www/html/public:ro
+      - app_storage:/var/www/html/storage:ro
+    healthcheck:
+      # 127.0.0.1, not localhost: this stack's laravel.conf replaces nginx:alpine's
+      # default server block (the one docker-entrypoint.d's IPv6 script patches to
+      # also `listen [::]`), so nginx only binds 0.0.0.0:80. wget resolving
+      # "localhost" tries ::1 first and gets a false-refused connection.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health | grep -q '\"status\":\"ok\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    depends_on:
+      app:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ninja
+      MYSQL_USER: ninja
+      MYSQL_PASSWORD: ninja
+      MYSQL_ROOT_PASSWORD: ninja-root-dev-only
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uninja", "-pninja"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  invoiceninja-mcp:
+    build: .
+    restart: unless-stopped
+    environment:
+      INVOICENINJA_SERVER_URL: http://invoiceninja:80
+    ports:
+      - "8081:8081"
+    depends_on:
+      invoiceninja:
+        condition: service_healthy
+
+volumes:
+  app_public:
+  app_storage:
+  mysql_data:
+  redis_data:

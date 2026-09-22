@@ -1,0 +1,21 @@
+[project]
+name = "invoiceninja_mcp"
+version = "0.1.0"
+description = "Standalone MCP server exposing the InvoiceNinja API over HTTP"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "fastmcp>=3.0.0",
+    "pyyaml>=6.0",
+    "uvicorn>=0.30",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

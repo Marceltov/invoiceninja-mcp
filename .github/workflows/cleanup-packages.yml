@@ -1,0 +1,25 @@
+name: Cleanup untagged packages
+
+# Weekly prune of orphaned, untagged GHCR image manifests (produced by
+# multi-arch builds' intermediate digests). Doesn't touch anything tagged.
+
+on:
+  schedule:
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Set lowercase package name
+        run: echo "IMAGE_NAME=$(basename "${GITHUB_REPOSITORY,,}")" >> "$GITHUB_ENV"
+
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ env.IMAGE_NAME }}
+          package-type: container
+          min-versions-to-keep: 0
+          delete-only-untagged-versions: true
