@@ -15,7 +15,7 @@ jobs:
       packages: write
     steps:
       - name: Set lowercase package name
-        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" | sed 's|.*/||' >> "$GITHUB_ENV"
+        run: echo "IMAGE_NAME=$(basename "${GITHUB_REPOSITORY,,}")" >> "$GITHUB_ENV"
 
       - uses: actions/delete-package-versions@v5
         with:

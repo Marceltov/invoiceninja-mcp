@@ -96,7 +96,16 @@ class TokenCaptureMiddleware:
             await self.app(scope, receive, send)
             return
         if scope.get("path") == HEALTH_PATH:
-            await self.app(scope, receive, send)
+            # Answered directly, without delegating into `self.app` (inner):
+            # when MCP_ALLOWED_HOSTS is set, inner's HostOriginGuardMiddleware
+            # would otherwise gate /health by Host header too, breaking the
+            # "always reachable" contract this middleware promises.
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain")],
+            })
+            await send({"type": "http.response.body", "body": b"ok"})
             return
         headers = dict(scope.get("headers") or [])
         authorization = headers.get(b"authorization", b"").decode()
@@ -302,7 +311,7 @@ def serve(mcp: FastMCP) -> None:
     allowed = os.environ.get(MCP_ALLOWED_HOSTS_ENV, "").strip()
     if allowed:
         hosts = [h.strip() for h in allowed.split(",") if h.strip()]
-        inner = mcp.http_app(path=path, allowed_hosts=hosts)
+        inner = mcp.http_app(path=path, allowed_hosts=hosts, host_origin_protection=True)
         print(f"Host protection ON; allowed hosts (plus localhost): {hosts}",
               file=sys.stderr)
     else:
