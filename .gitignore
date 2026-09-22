@@ -1,0 +1,10 @@
+# Python / uv
+**/.venv/
+**/__pycache__/
+*.pyc
+
+# Local config with secrets
+*.token
+
+# Superpowers design docs (brainstorming specs / implementation plans) — local only
+docs/superpowers/
