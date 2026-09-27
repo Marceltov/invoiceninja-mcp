@@ -208,3 +208,33 @@ def test_build_error_server_exposes_startup_error_tool():
 
     result = asyncio.run(run())
     assert "spec exploded" in result.content[0].text
+
+
+def test_responses_that_deviate_from_spec_schema_are_not_rejected():
+    # The spec's response schemas are inaccurate (e.g. Client.country_id is
+    # typed integer, but real InvoiceNinja returns the string "276"). With
+    # FastMCP's default output validation, every such read tool errored with
+    # "Structured content does not match the tool's output schema".
+    from fastmcp import Client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": "abc", "country_id": "276"}]})
+
+    client = httpx.AsyncClient(
+        base_url="http://invoiceninja:80",
+        auth=server.InvoiceNinjaTokenAuth(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def run():
+        reset = server._incoming_auth.set("test-token")
+        try:
+            async with Client(server.build_server(client=client)) as c:
+                return await c.call_tool("getClients", {
+                    "X-API-TOKEN": "x", "X-Requested-With": "XMLHttpRequest",
+                })
+        finally:
+            server._incoming_auth.reset(reset)
+
+    result = asyncio.run(run())
+    assert result.structured_content["data"][0]["country_id"] == "276"

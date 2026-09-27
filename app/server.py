@@ -352,10 +352,15 @@ def build_server(client: httpx.AsyncClient | None = None) -> FastMCP:
     # invalidate its own credential. uploadClient is excluded and replaced
     # because FastMCP can't express real binary file bytes in its JSON
     # tool schema (see register_upload_client_tool).
+    # validate_output=False: the spec's response schemas don't match what
+    # InvoiceNinja actually returns (e.g. Client.country_id typed integer,
+    # returned as "276"; dates typed "date", returned as ""), so strict
+    # validation rejected real responses on read tools like getClients.
     mcp = FastMCP.from_openapi(
         openapi_spec=spec,
         client=client,
         name="InvoiceNinja MCP",
+        validate_output=False,
         route_maps=[
             RouteMap(
                 methods=["POST"],
