@@ -191,6 +191,18 @@ def test_update_company_tool_exposes_body_parameters():
     assert "settings" in props
 
 
+def test_store_design_takes_design_as_object():
+    # The spec types Design.design as an HTML string, but InvoiceNinja stores
+    # and requires it as an object of template parts (includes, header, body,
+    # product, task, footer) -- a string can't create a working design.
+    mcp = server.build_server()
+    tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+    for name in ("storeDesign", "updateDesign"):
+        design = tools[name].parameters["properties"]["design"]
+        assert design["type"] == "object"
+        assert "includes" in design["properties"]
+
+
 def test_build_error_server_exposes_startup_error_tool():
     import asyncio
 

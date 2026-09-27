@@ -253,6 +253,28 @@ def _patch_missing_request_bodies(spec: dict) -> None:
             }
 
 
+_DESIGN_PARTS = ("includes", "header", "body", "product", "task", "footer")
+
+
+def _patch_design_schema(spec: dict) -> None:
+    """Retype Design.design from string to the object InvoiceNinja uses.
+
+    The spec documents it as a single HTML string, but InvoiceNinja stores
+    (and getDesigns returns) an object of template parts -- includes (CSS),
+    header, body, product, task, footer. With the string type,
+    storeDesign/updateDesign couldn't send a working design at all.
+    In-memory for the same reason as _patch_missing_request_bodies.
+    """
+    design = spec.get("components", {}).get("schemas", {}).get("Design")
+    if design is None:
+        return
+    design.setdefault("properties", {})["design"] = {
+        "description": "Template parts; `includes` holds the <style> block.",
+        "type": "object",
+        "properties": {part: {"type": "string"} for part in _DESIGN_PARTS},
+    }
+
+
 def load_spec(spec_path: Path) -> dict:
     """Parse the on-disk InvoiceNinja OpenAPI spec into a dict.
 
@@ -272,6 +294,7 @@ def load_spec(spec_path: Path) -> dict:
         raise RuntimeError(f"OpenAPI spec at {spec_path} is not a valid mapping.")
     spec = _stringify_keys(spec)
     _patch_missing_request_bodies(spec)
+    _patch_design_schema(spec)
     return spec
 
 
