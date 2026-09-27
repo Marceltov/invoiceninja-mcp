@@ -18,6 +18,7 @@
 import base64
 import os
 import sys
+import time
 import traceback
 from contextvars import ContextVar
 from pathlib import Path
@@ -275,27 +276,102 @@ def _patch_design_schema(spec: dict) -> None:
     }
 
 
-def load_spec(spec_path: Path) -> dict:
-    """Parse the on-disk InvoiceNinja OpenAPI spec into a dict.
+def parse_spec(text: str, source: str) -> dict:
+    """Parse InvoiceNinja OpenAPI spec text into a patched dict.
 
     The spec ships as YAML; because YAML is a superset of JSON this also
-    parses a JSON spec, so the file can be swapped for either format.
+    parses a JSON spec, so either format works.
     """
-    if not spec_path.exists():
-        raise RuntimeError(f"OpenAPI spec not found at {spec_path}.")
-    text = spec_path.read_text()
     if not text.strip():
         raise RuntimeError(
-            f"OpenAPI spec at {spec_path} is empty -- populate it with the "
+            f"OpenAPI spec at {source} is empty -- populate it with the "
             f"InvoiceNinja OpenAPI spec."
         )
     spec = yaml.safe_load(text)
     if not isinstance(spec, dict):
-        raise RuntimeError(f"OpenAPI spec at {spec_path} is not a valid mapping.")
+        raise RuntimeError(f"OpenAPI spec at {source} is not a valid mapping.")
     spec = _stringify_keys(spec)
     _patch_missing_request_bodies(spec)
     _patch_design_schema(spec)
     return spec
+
+
+def load_spec(spec_path: Path) -> dict:
+    """Parse the on-disk InvoiceNinja OpenAPI spec into a dict."""
+    if not spec_path.exists():
+        raise RuntimeError(f"OpenAPI spec not found at {spec_path}.")
+    return parse_spec(spec_path.read_text(), str(spec_path))
+
+
+# InvoiceNinja publishes its spec per release tag; the file at a tag is
+# byte-identical to the one baked into that version's image.
+UPSTREAM_SPEC_URL = (
+    "https://raw.githubusercontent.com/invoiceninja/invoiceninja/"
+    "v{version}/openapi/api-docs.yaml"
+)
+
+
+def fetch_instance_spec(
+    server_url: str,
+    http: httpx.Client,
+    attempts: int = 5,
+    retry_delay: float = 3,
+) -> dict | None:
+    """Fetch the upstream spec matching the running instance's version.
+
+    InvoiceNinja sends `X-APP-VERSION` on every API response -- even a 403
+    to an unauthenticated ping -- so no token is needed. Retries the ping a
+    few times because the sidecar often starts before InvoiceNinja is up.
+    Returns None (caller falls back to the bundled spec) on any failure:
+    no internet, unknown version tag, instance unreachable.
+    """
+    version = None
+    for attempt in range(attempts):
+        try:
+            response = http.get(
+                f"{server_url}/api/v1/ping",
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+            version = response.headers.get("X-APP-VERSION")
+            break
+        except httpx.HTTPError as e:
+            if attempt == attempts - 1:
+                print(f"Warning: InvoiceNinja unreachable for version check: {e}",
+                      file=sys.stderr)
+                return None
+            time.sleep(retry_delay)
+    if not version:
+        print("Warning: InvoiceNinja sent no X-APP-VERSION header.", file=sys.stderr)
+        return None
+    url = UPSTREAM_SPEC_URL.format(version=version)
+    try:
+        response = http.get(url)
+        response.raise_for_status()
+        spec = parse_spec(response.text, url)
+    except (httpx.HTTPError, RuntimeError, yaml.YAMLError) as e:
+        print(f"Warning: could not load spec for InvoiceNinja {version}: {e}",
+              file=sys.stderr)
+        return None
+    print(f"Using OpenAPI spec for InvoiceNinja {version} from {url}", file=sys.stderr)
+    return spec
+
+
+def resolve_spec(server_url: str) -> dict:
+    """Pick the spec to build tools from.
+
+    An explicit INVOICENINJA_API_SPEC file always wins (offline setups,
+    pinned deployments); otherwise the spec matching the instance's version,
+    falling back to the bundled one.
+    """
+    if os.environ.get(SPEC_ENV):
+        return load_spec(Path(os.environ[SPEC_ENV]))
+    with httpx.Client(timeout=30, follow_redirects=True) as http:
+        spec = fetch_instance_spec(server_url, http)
+    if spec is not None:
+        return spec
+    print(f"Falling back to the bundled OpenAPI spec at {DEFAULT_SPEC}.",
+          file=sys.stderr)
+    return load_spec(DEFAULT_SPEC)
 
 
 def register_health(mcp: FastMCP) -> None:
@@ -344,7 +420,9 @@ def register_upload_client_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None
         return f"Uploaded {filename!r} to client {id!r}."
 
 
-def build_server(client: httpx.AsyncClient | None = None) -> FastMCP:
+def build_server(
+    client: httpx.AsyncClient | None = None, spec: dict | None = None
+) -> FastMCP:
     """Load the local OpenAPI spec and turn every documented InvoiceNinja
     endpoint into a FastMCP tool. The API token is supplied per request by the
     client (see TokenCaptureMiddleware / InvoiceNinjaTokenAuth), so no token
@@ -366,8 +444,8 @@ def build_server(client: httpx.AsyncClient | None = None) -> FastMCP:
             base_url=server_url, auth=InvoiceNinjaTokenAuth(), timeout=60
         )
 
-    spec_path = Path(os.environ.get(SPEC_ENV, str(DEFAULT_SPEC)))
-    spec = load_spec(spec_path)
+    if spec is None:
+        spec = load_spec(Path(os.environ.get(SPEC_ENV, str(DEFAULT_SPEC))))
 
     # login/logout manage InvoiceNinja session tokens, but an MCP client
     # already authenticates via the Authorization header -- an LLM has no
@@ -460,7 +538,8 @@ def serve(mcp: FastMCP) -> None:
 
 def main():
     try:
-        mcp = build_server()
+        server_url = os.environ.get(SERVER_ENV, DEFAULT_SERVER_URL).rstrip("/")
+        mcp = build_server(spec=resolve_spec(server_url))
     except Exception as e:
         print(f"Error: failed to build InvoiceNinja MCP server: {e}",
               file=sys.stderr)

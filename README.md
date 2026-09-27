@@ -1,6 +1,6 @@
 # InvoiceNinja MCP server
 
-A standalone [MCP](https://modelcontextprotocol.io) server that exposes the [InvoiceNinja](https://invoiceninja.com) v5 REST API as MCP tools. It runs as a **container sidecar** next to your InvoiceNinja instance: nearly every documented API endpoint is turned into an MCP tool at startup via `FastMCP.from_openapi` (**363 tools**, generated from the spec's 365 documented operations — `storeInvoice`, `getClients`, `showInvoice`, `storeClient`, …; the session endpoints `login`/`logout` are excluded), served over streamable **HTTP** so any MCP client connects to it by URL.
+A standalone [MCP](https://modelcontextprotocol.io) server that exposes the [InvoiceNinja](https://invoiceninja.com) v5 REST API as MCP tools. It runs as a **container sidecar** next to your InvoiceNinja instance: nearly every documented API endpoint is turned into an MCP tool at startup via `FastMCP.from_openapi` (**377 tools** against InvoiceNinja 5.13.43, generated from the spec's 379 documented operations — `storeInvoice`, `getClients`, `showInvoice`, `storeClient`, …; the session endpoints `login`/`logout` are excluded), served over streamable **HTTP** so any MCP client connects to it by URL.
 
 ## Architecture
 
@@ -58,8 +58,12 @@ All configuration is via environment variables:
 | `MCP_HOST` | `0.0.0.0` | Interface the MCP server binds to. |
 | `MCP_PORT` | `8081` | Port the MCP server listens on. |
 | `MCP_PATH` | `/mcp` | HTTP path the MCP endpoint is served at. |
-| `INVOICENINJA_API_SPEC` | bundled spec | Override the OpenAPI spec path. |
+| `INVOICENINJA_API_SPEC` | *(unset)* | Path to a fixed OpenAPI spec file; skips the version-matched download (see below). |
 | `MCP_ALLOWED_HOSTS` | *(unset = any)* | Comma-separated `Host` allowlist (DNS-rebinding protection). |
+
+### Which API spec is used
+
+The tools are generated from the OpenAPI spec that matches **your** InvoiceNinja version. At startup the server reads the instance's version from the `X-APP-VERSION` header of an unauthenticated `/api/v1/ping` and downloads that release's spec from `raw.githubusercontent.com/invoiceninja/invoiceninja/v<version>/openapi/api-docs.yaml`. If that fails (no internet, instance not up, unknown version), it falls back to the bundled spec (currently 5.13.43) and logs a warning. Set `INVOICENINJA_API_SPEC` to pin a file instead, e.g. for offline setups; any InvoiceNinja image contains its own at `/var/www/html/openapi/api-docs.yaml`.
 
 ## TLS / reverse proxy
 
