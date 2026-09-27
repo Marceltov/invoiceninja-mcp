@@ -276,6 +276,45 @@ def _patch_design_schema(spec: dict) -> None:
     }
 
 
+# Document write operations whose bodies omit design_id although the entity
+# (Invoice, Quote, ...) carries it and InvoiceNinja accepts it on write.
+_DESIGNABLE_WRITE_OPS = {
+    f"{verb}{entity}"
+    for verb in ("store", "update")
+    for entity in ("Invoice", "Quote", "Credit", "RecurringInvoice",
+                   "RecurringQuote", "PurchaseOrder")
+}
+def _patch_request_bodies(spec: dict) -> None:
+    """Treat request body schemas as hints, not gates.
+
+    The spec's `required` lists are unreliable (updateQuote demanded
+    date/due_date, blocking quotes that have none), and InvoiceNinja
+    validates every body itself with real error messages -- so drop them.
+    Also add design_id to document write bodies, which omit it although the
+    entities carry it. Fields the spec lacks entirely are what apiRequest is for.
+    """
+    schemas = spec.get("components", {}).get("schemas", {})
+    for methods in spec.get("paths", {}).values():
+        if not isinstance(methods, dict):
+            continue
+        for op in methods.values():
+            if not isinstance(op, dict):
+                continue
+            body = (op.get("requestBody", {}).get("content", {})
+                    .get("application/json", {}).get("schema"))
+            if not isinstance(body, dict):
+                continue
+            ref = body.get("$ref", "")
+            if ref:
+                body = schemas.get(ref.rsplit("/", 1)[-1], {})
+            body.pop("required", None)
+            if op.get("operationId") in _DESIGNABLE_WRITE_OPS:
+                body.setdefault("properties", {}).setdefault("design_id", {
+                    "description": "Hashed ID of the design to render this document with.",
+                    "type": "string",
+                })
+
+
 def parse_spec(text: str, source: str) -> dict:
     """Parse InvoiceNinja OpenAPI spec text into a patched dict.
 
@@ -293,6 +332,7 @@ def parse_spec(text: str, source: str) -> dict:
     spec = _stringify_keys(spec)
     _patch_missing_request_bodies(spec)
     _patch_design_schema(spec)
+    _patch_request_bodies(spec)
     return spec
 
 
@@ -380,6 +420,48 @@ def register_health(mcp: FastMCP) -> None:
     @mcp.custom_route(HEALTH_PATH, methods=["GET"])
     async def health(_request: Request):
         return PlainTextResponse("ok")
+
+
+_API_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+
+
+def register_api_request_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None:
+    """Register a raw pass-through to the InvoiceNinja API.
+
+    The upstream spec is wrong in many places (missing fields, wrong types,
+    missing bodies), and FastMCP silently drops arguments a generated tool's
+    schema doesn't declare. Rather than patching each gap as it's hit, this
+    gives callers an escape hatch; InvoiceNinja's own validation errors come
+    back as data. Restricted to /api/v1/ on the configured instance, with the
+    caller's own token -- no more access than the generated tools have.
+    """
+
+    @mcp.tool(name="apiRequest")
+    async def api_request(
+        method: str,
+        path: str,
+        query: dict | None = None,
+        body: dict | list | None = None,
+    ) -> dict:
+        """Call any InvoiceNinja API endpoint directly.
+
+        Use when a generated tool lacks a field or rejects valid input
+        because the published API spec is wrong. `path` must start with
+        /api/v1/ (e.g. "/api/v1/quotes/{id}"). Returns {"status", "body"};
+        a 4xx status with InvoiceNinja's validation message is returned,
+        not raised, so the request can be corrected.
+        """
+        method = method.upper()
+        if method not in _API_METHODS:
+            raise ValueError(f"method must be one of {_API_METHODS}")
+        if not path.startswith("/api/v1/") or ".." in path:
+            raise ValueError("path must start with /api/v1/ and not contain '..'")
+        response = await client.request(method, path, params=query, json=body)
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = response.text
+        return {"status": response.status_code, "body": payload}
 
 
 def register_upload_client_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None:
@@ -476,6 +558,7 @@ def build_server(
         ],
     )
     register_upload_client_tool(mcp, client)
+    register_api_request_tool(mcp, client)
     register_health(mcp)
     return mcp
 

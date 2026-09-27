@@ -250,3 +250,71 @@ def test_responses_that_deviate_from_spec_schema_are_not_rejected():
 
     result = asyncio.run(run())
     assert result.structured_content["data"][0]["country_id"] == "276"
+
+
+def test_entity_write_tools_accept_design_id():
+    # The spec's read models (Invoice, Quote, ...) carry design_id, but none
+    # of the write bodies do, so a per-document design couldn't be set.
+    mcp = server.build_server()
+    tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+    for name in ("updateQuote", "updateInvoice", "updateCredit",
+                 "storeQuote", "storeInvoice", "updatePurchaseOrder"):
+        assert "design_id" in tools[name].parameters["properties"], name
+
+
+def test_request_bodies_require_nothing():
+    # The spec over-requires body fields (e.g. updateQuote demanded date and
+    # due_date; quotes without a due date exist). InvoiceNinja validates
+    # bodies itself, so only path/header params stay required.
+    mcp = server.build_server()
+    tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+    required = set(tools["updateQuote"].parameters.get("required", []))
+    assert required <= {"X-API-TOKEN", "X-Requested-With", "id__path", "id"}
+
+
+def _api_request(handler, args):
+    from fastmcp import Client
+
+    client = httpx.AsyncClient(
+        base_url="http://invoiceninja:80",
+        auth=server.InvoiceNinjaTokenAuth(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def run():
+        reset = server._incoming_auth.set("test-token")
+        try:
+            async with Client(server.build_server(client=client)) as c:
+                return await c.call_tool("apiRequest", args, raise_on_error=False)
+        finally:
+            server._incoming_auth.reset(reset)
+
+    return asyncio.run(run())
+
+
+def test_api_request_forwards_raw_call_and_returns_status_and_body():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(method=request.method, path=request.url.path,
+                    query=dict(request.url.params), body=request.content,
+                    token=request.headers.get("X-API-TOKEN"))
+        return httpx.Response(422, json={"message": "invalid", "errors": {}})
+
+    result = _api_request(handler, {
+        "method": "PUT", "path": "/api/v1/quotes/abc",
+        "query": {"mark_sent": "true"}, "body": {"design_id": "xyz"},
+    })
+    assert seen["method"] == "PUT" and seen["path"] == "/api/v1/quotes/abc"
+    assert seen["query"] == {"mark_sent": "true"}
+    assert b'"design_id"' in seen["body"] and seen["token"] == "test-token"
+    # Validation errors come back as data, so the caller can fix its request.
+    assert result.structured_content["status"] == 422
+    assert result.structured_content["body"]["message"] == "invalid"
+
+
+def test_api_request_only_reaches_the_api():
+    result = _api_request(lambda r: httpx.Response(200), {
+        "method": "GET", "path": "/../admin",
+    })
+    assert result.is_error

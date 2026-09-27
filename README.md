@@ -2,6 +2,8 @@
 
 A standalone [MCP](https://modelcontextprotocol.io) server that exposes the [InvoiceNinja](https://invoiceninja.com) v5 REST API as MCP tools. It runs as a **container sidecar** next to your InvoiceNinja instance: nearly every documented API endpoint is turned into an MCP tool at startup via `FastMCP.from_openapi` (**377 tools** against InvoiceNinja 5.13.43, generated from the spec's 379 documented operations — `storeInvoice`, `getClients`, `showInvoice`, `storeClient`, …; the session endpoints `login`/`logout` are excluded), served over streamable **HTTP** so any MCP client connects to it by URL.
 
+InvoiceNinja's published API spec is inaccurate in places (missing fields, wrong types, over-strict required lists), so the generated tools treat it as a hint: request bodies require nothing up front and responses aren't validated against it — InvoiceNinja's own validation errors come back instead. For anything a generated tool can't express, the **`apiRequest`** tool calls any `/api/v1/...` endpoint directly with your token.
+
 ## Architecture
 
 **invoiceninja-mcp** (this repo) runs as a container sidecar and talks to InvoiceNinja over the internal Docker network, so InvoiceNinja's API is never exposed publicly on its own. Clients reach invoiceninja-mcp either through a TLS-terminating reverse proxy or directly over a trusted LAN — in both cases the API token they present is the only credential.
