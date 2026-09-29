@@ -16,6 +16,7 @@
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import base64
+import json
 import os
 import sys
 import time
@@ -28,6 +29,9 @@ import uvicorn
 import yaml
 from fastmcp import FastMCP
 from fastmcp.server.providers.openapi import MCPType, RouteMap
+from fastmcp.tools import ToolResult
+from fastmcp.utilities.types import File
+from mcp.types import TextContent
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -425,6 +429,31 @@ def register_health(mcp: FastMCP) -> None:
 _API_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 
 
+def _is_binary(content_type: str) -> bool:
+    """Anything that isn't JSON or text: PDFs, images, zip exports, ..."""
+    return bool(content_type) and not (
+        content_type.startswith("text/")
+        or content_type == "application/json"
+        or content_type.endswith("+json")
+    )
+
+
+def _binary_result(response: httpx.Response, content_type: str) -> ToolResult:
+    """Return a binary response as an embedded file instead of mangled text,
+    so a client can actually open e.g. a rendered invoice PDF."""
+    filename = response.headers.get("content-disposition", "")
+    filename = filename.split("filename=")[-1].strip('"; ') if "filename=" in filename else "download"
+    meta = {"status": response.status_code, "content_type": content_type,
+            "filename": filename, "size": len(response.content)}
+    return ToolResult(
+        content=[
+            TextContent(type="text", text=json.dumps(meta)),
+            File(data=response.content, name=filename).to_resource_content(mime_type=content_type),
+        ],
+        structured_content=meta,
+    )
+
+
 def register_api_request_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None:
     """Register a raw pass-through to the InvoiceNinja API.
 
@@ -449,7 +478,8 @@ def register_api_request_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None:
         because the published API spec is wrong. `path` must start with
         /api/v1/ (e.g. "/api/v1/quotes/{id}"). Returns {"status", "body"};
         a 4xx status with InvoiceNinja's validation message is returned,
-        not raised, so the request can be corrected.
+        not raised, so the request can be corrected. Binary responses (e.g.
+        "/api/v1/quotes/{id}/download" PDFs) come back as an embedded file.
         """
         method = method.upper()
         if method not in _API_METHODS:
@@ -457,6 +487,9 @@ def register_api_request_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None:
         if not path.startswith("/api/v1/") or ".." in path:
             raise ValueError("path must start with /api/v1/ and not contain '..'")
         response = await client.request(method, path, params=query, json=body)
+        content_type = response.headers.get("content-type", "").split(";")[0].strip()
+        if _is_binary(content_type):
+            return _binary_result(response, content_type)
         try:
             payload = response.json()
         except ValueError:
