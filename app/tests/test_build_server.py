@@ -318,3 +318,29 @@ def test_api_request_only_reaches_the_api():
         "method": "GET", "path": "/../admin",
     })
     assert result.is_error
+
+
+def test_api_request_returns_binary_responses_as_an_embedded_file():
+    pdf = b"%PDF-1.7 fake quote"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=pdf, headers={
+            "content-type": "application/pdf",
+            "content-disposition": 'attachment; filename="3D-2026-0001.pdf"',
+        })
+
+    result = _api_request(handler, {"method": "GET", "path": "/api/v1/quotes/abc/download"})
+    assert not result.is_error
+    assert result.structured_content == {
+        "status": 200, "content_type": "application/pdf",
+        "filename": "3D-2026-0001.pdf", "size": len(pdf),
+    }
+    resource = result.content[1].resource
+    assert resource.mime_type == "application/pdf"
+    assert base64.b64decode(resource.blob) == pdf
+
+
+def test_api_request_still_returns_text_and_json_as_data():
+    result = _api_request(lambda r: httpx.Response(200, text="pong"),
+                          {"method": "GET", "path": "/api/v1/ping"})
+    assert result.structured_content == {"status": 200, "body": "pong"}
