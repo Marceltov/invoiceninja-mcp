@@ -12,11 +12,11 @@ The whole server is one module, `app/server.py`.
 sequenceDiagram
     participant C as MCP client
     participant M as TokenCaptureMiddleware
-    participant T as Tool (FastMCP)
+    participant T as FastMCP tool
     participant A as InvoiceNinjaTokenAuth
     participant I as InvoiceNinja
     C->>M: request + Authorization header
-    M->>M: 401 if header missing; store in contextvar
+    M->>M: 401 if header missing, else store in contextvar
     M->>T: call tool
     T->>A: outgoing httpx request
     A->>I: X-API-TOKEN + X-Requested-With: XMLHttpRequest

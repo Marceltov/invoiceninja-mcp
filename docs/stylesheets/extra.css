@@ -1,0 +1,18 @@
+/* InvoiceNinja brand: green on near-black */
+:root,
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #1f2124;
+  --md-primary-fg-color--light: #33373d;
+  --md-primary-fg-color--dark: #0c0d0e;
+  --md-accent-fg-color: #00bc7d;
+  --md-typeset-a-color: #009c68;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #1f2124;
+  --md-primary-fg-color--light: #33373d;
+  --md-primary-fg-color--dark: #0c0d0e;
+  --md-accent-fg-color: #00d492;
+  --md-typeset-a-color: #00d492;
+  --md-default-bg-color: #17181a;
+}
