@@ -34,6 +34,7 @@ import yaml
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, OAuthProvider
 from fastmcp.server.auth.auth import ClientRegistrationOptions, RevocationOptions
+from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.providers.openapi import MCPType, RouteMap
 from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import File
@@ -106,10 +107,15 @@ class InvoiceNinjaTokenAuth(httpx.Auth):
     it: InvoiceNinja's developer docs describe it as required security-minded
     header on API calls, and sending it costs nothing on requests where it
     turns out not to be enforced.
+
+    With OAuth (see InvoiceNinjaOAuthProvider), FastMCP's request-scoped access
+    token carries the API token in `claims["api_token"]`; otherwise it is the
+    raw client header.
     """
 
     def auth_flow(self, request: httpx.Request):
-        raw = _incoming_auth.get()
+        access = get_access_token()
+        raw = access.claims.get("api_token") if access else _incoming_auth.get()
         if raw and raw[:7].lower() == "bearer ":
             raw = raw[7:].strip()
         if not raw:
@@ -1064,7 +1070,9 @@ def register_upload_client_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None
 
 
 def build_server(
-    client: httpx.AsyncClient | None = None, spec: dict | None = None
+    client: httpx.AsyncClient | None = None,
+    spec: dict | None = None,
+    auth: InvoiceNinjaOAuthProvider | None = None,
 ) -> FastMCP:
     """Load the local OpenAPI spec and turn every documented InvoiceNinja
     endpoint into a FastMCP tool. The API token is supplied per request by the
@@ -1073,7 +1081,7 @@ def build_server(
 
     `client` is injectable for testing; in production the default client
     targets INVOICENINJA_SERVER_URL and authenticates from the per-request
-    contextvar.
+    contextvar. `auth` enables OAuth; None keeps plain token pass-through.
     """
     if client is None:
         # No /api/v1 suffix here: unlike trillium-mcp's ETAPI spec (whose
@@ -1103,6 +1111,7 @@ def build_server(
     mcp = FastMCP.from_openapi(
         openapi_spec=spec,
         client=client,
+        auth=auth,
         name="InvoiceNinja MCP",
         validate_output=False,
         route_maps=[
@@ -1137,7 +1146,7 @@ def build_error_server(error: BaseException) -> FastMCP:
     instructions = (
         f"This InvoiceNinja MCP server FAILED TO START and exposes no "
         f"InvoiceNinja tools.\n\nReason: {summary}\n\nThe bundled OpenAPI spec "
-        f"could not be loaded. Call the `startup_error` tool for the full error."
+        f"could not be loaded, or the auth configuration is invalid. Call the `startup_error` tool for the full error."
     )
     mcp = FastMCP(
         name="InvoiceNinja MCP (startup failed)",
@@ -1156,9 +1165,83 @@ def build_error_server(error: BaseException) -> FastMCP:
     return mcp
 
 
-def serve(mcp: FastMCP) -> None:
-    """Serve an MCP server over streamable HTTP behind the token-capture
-    middleware, using the MCP_* environment configuration."""
+class BearerPrefixMiddleware:
+    """`both` mode: turn a raw `Authorization: <api token>` header -- what
+    token-mode clients send -- into `Bearer <token>`, the only form FastMCP's
+    OAuth middleware reads. InvoiceNinjaOAuthProvider.verify_token then passes it
+    through to InvoiceNinja. Pure ASGI, like TokenCaptureMiddleware.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = []
+            for name, value in scope.get("headers") or []:
+                if name == b"authorization" and value and b" " not in value.strip():
+                    value = b"Bearer " + value.strip()
+                headers.append((name, value))
+            scope = {**scope, "headers": headers}
+        await self.app(scope, receive, send)
+
+
+ISS_METADATA_PREFIX = "/.well-known/oauth-authorization-server"
+
+
+class IssuerFlagMiddleware:
+    """Add `authorization_response_iss_parameter_supported: true` (RFC 9207) to
+    the authorization-server metadata. The MCP SDK builds that document without
+    the flag, but /login does send `iss` on the redirect, and the spec requires
+    advertising it when included. Buffers only that one small JSON response.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope.get("path", "").startswith(ISS_METADATA_PREFIX):
+            await self.app(scope, receive, send)
+            return
+        start, chunks = None, []
+
+        async def capture(message):
+            nonlocal start
+            if message["type"] == "http.response.start":
+                start = message
+            elif message["type"] == "http.response.body":
+                chunks.append(message.get("body", b""))
+                if message.get("more_body"):
+                    return
+                body = b"".join(chunks)
+                if start["status"] == 200:
+                    try:
+                        doc = json.loads(body)
+                        doc["authorization_response_iss_parameter_supported"] = True
+                        body = json.dumps(doc).encode()
+                    except ValueError:
+                        pass
+                headers = [(k, v) for k, v in start["headers"] if k.lower() != b"content-length"]
+                headers.append((b"content-length", str(len(body)).encode()))
+                await send({**start, "headers": headers})
+                await send({"type": "http.response.body", "body": body})
+
+        await self.app(scope, receive, capture)
+
+
+def wrap_app(inner, mode: str):
+    """Put the auth-mode's ASGI gate in front of FastMCP's app."""
+    if mode == "token":
+        return TokenCaptureMiddleware(inner)
+    if mode == "both":
+        return IssuerFlagMiddleware(BearerPrefixMiddleware(inner))
+    return IssuerFlagMiddleware(inner)
+
+
+def serve(mcp: FastMCP, mode: str = "token") -> None:
+    """Serve an MCP server over streamable HTTP, using the MCP_* environment
+    configuration. In `token` mode TokenCaptureMiddleware gates the endpoint;
+    otherwise FastMCP's OAuth middleware does (see InvoiceNinjaOAuthProvider)."""
     host = os.environ.get(MCP_HOST_ENV, DEFAULT_HOST)
     port = int(os.environ.get(MCP_PORT_ENV, DEFAULT_PORT))
     path = os.environ.get(MCP_PATH_ENV, DEFAULT_PATH)
@@ -1173,23 +1256,28 @@ def serve(mcp: FastMCP) -> None:
         inner = mcp.http_app(path=path, host_origin_protection=False)
         print(f"Host protection OFF (any Host accepted) -- set "
               f"{MCP_ALLOWED_HOSTS_ENV} to restrict.", file=sys.stderr)
-    app = TokenCaptureMiddleware(inner)
+    app = wrap_app(inner, mode)
 
     print(f"Serving InvoiceNinja MCP on http://{host}:{port}{path} "
-          f"(client supplies the API token via the Authorization header)",
+          + (f"(client supplies the API token via the Authorization header)"
+          if mode == "token" else f"(auth mode: {mode})"),
           file=sys.stderr)
     uvicorn.run(app, host=host, port=port)
 
 
 def main():
+    mode = "token"
     try:
+        mode = resolve_auth_mode()
+        auth = None if mode == "token" else build_oauth_provider(mode)
         server_url = os.environ.get(SERVER_ENV, DEFAULT_SERVER_URL).rstrip("/")
-        mcp = build_server(spec=resolve_spec(server_url))
+        mcp = build_server(spec=resolve_spec(server_url), auth=auth)
     except Exception as e:
         print(f"Error: failed to build InvoiceNinja MCP server: {e}",
               file=sys.stderr)
+        mode = "token"
         mcp = build_error_server(e)
-    serve(mcp)
+    serve(mcp, mode)
 
 
 if __name__ == "__main__":

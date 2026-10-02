@@ -350,3 +350,172 @@ def test_replayed_login_says_completed_and_mints_nothing():
     again = c.post("/login", data={"id": pid, "email": "a@b.c", "password": "pw"})
     assert again.status_code == 200 and "already" in again.text.lower()
     assert len([x for x in calls if x.url.path == "/api/v1/tokens"]) == mints_before
+
+
+import base64
+import hashlib
+import secrets
+
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+
+REDIRECT = "http://localhost:9/cb"
+
+
+def make_app(passthrough, seen):
+    """Full in-process stack: provider + generated tools + wrap_app, one fake
+    InvoiceNinja that records the X-API-TOKEN of GET /api/v1/clients and of the
+    upload endpoint."""
+    calls = []
+    base_handler = fake_invoiceninja(calls)
+
+    def handler(request):
+        if request.url.path == "/api/v1/clients":
+            seen["token"] = request.headers.get("X-API-TOKEN")
+            return httpx.Response(200, json={"data": [], "meta": {}})
+        if request.url.path == "/api/v1/clients/abc/upload":
+            seen["upload_token"] = request.headers.get("X-API-TOKEN")
+            return httpx.Response(200, json={"data": {"id": "abc"}})
+        return base_handler(request)
+
+    mock = httpx.MockTransport(handler)
+    provider = server.InvoiceNinjaOAuthProvider(
+        base_url="http://localhost", store=MemoryStore(), passthrough=passthrough,
+        api=httpx.AsyncClient(base_url="http://invoiceninja:80", transport=mock,
+                              headers={"X-Requested-With": "XMLHttpRequest"}),
+    )
+    mcp = server.build_server(
+        client=httpx.AsyncClient(base_url="http://invoiceninja:80",
+                                 auth=server.InvoiceNinjaTokenAuth(), transport=mock),
+        auth=provider,
+    )
+    inner = mcp.http_app(path=server.DEFAULT_PATH)
+    mode = "both" if passthrough else "oauth"
+    return inner, server.wrap_app(inner, mode)
+
+
+def factory_for(app):
+    def factory(**kw):
+        kw.pop("transport", None)
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://localhost", **kw
+        )
+    return factory
+
+
+async def oauth_access_token(http) -> str:
+    """register -> authorize -> /login -> /token; returns the access token."""
+    r = await http.post("/register", json={
+        "client_name": "itest", "redirect_uris": [REDIRECT],
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    })
+    client_id = r.json()["client_id"]
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    r = await http.get("/authorize", params={
+        "response_type": "code", "client_id": client_id,
+        "redirect_uri": REDIRECT, "code_challenge": challenge,
+        "code_challenge_method": "S256", "state": "s1",
+        "resource": "http://localhost/mcp",
+    })
+    pending = httpx.URL(r.headers["location"]).params["id"]
+    r = await http.post("/login", data={"id": pending, "email": "a@b.c", "password": "pw"})
+    back = httpx.URL(r.headers["location"])
+    assert back.params["state"] == "s1" and back.params["iss"] == "http://localhost"
+    r = await http.post("/token", data={
+        "grant_type": "authorization_code", "code": back.params["code"],
+        "redirect_uri": REDIRECT, "client_id": client_id,
+        "code_verifier": verifier, "resource": "http://localhost/mcp",
+    })
+    return r.json()["access_token"]
+
+
+def test_full_oauth_flow_forwards_minted_token():
+    """register -> authorize -> /login -> token -> MCP tool call, in-process."""
+    seen = {}
+    inner, app = make_app(False, seen)
+    factory = factory_for(app)
+
+    async def run():
+        async with inner.router.lifespan_context(inner):
+            async with factory() as http:
+                assert (await http.get("/health")).status_code == 200
+                r = await http.post(server.DEFAULT_PATH, json={})
+                assert r.status_code == 401
+                assert "resource_metadata" in r.headers["www-authenticate"]
+                access = await oauth_access_token(http)
+
+            transport = StreamableHttpTransport(
+                url="http://localhost/mcp",
+                headers={"Authorization": f"Bearer {access}"},
+                httpx_client_factory=factory,
+            )
+            async with Client(transport) as c:
+                return await c.call_tool("getClients", {})
+
+    asyncio.run(run())
+    assert seen["token"] == "minted-tok"
+
+
+def test_upload_route_forwards_the_oauth_token():
+    """The plain-HTTP /upload/{entity}/{id} route shares the client, so it must
+    carry the OAuth-minted token too -- and refuse a request with no bearer."""
+    seen = {}
+    inner, app = make_app(False, seen)
+
+    async def run():
+        async with inner.router.lifespan_context(inner):
+            async with factory_for(app)() as http:
+                files = {"documents": ("a.txt", b"hello", "text/plain")}
+                anon = await http.post("/upload/clients/abc", files=files)
+                access = await oauth_access_token(http)
+                ok = await http.post(
+                    "/upload/clients/abc", files=files,
+                    headers={"Authorization": f"Bearer {access}"},
+                )
+                return anon.status_code, ok.status_code
+
+    anon_status, ok_status = asyncio.run(run())
+    assert anon_status == 401
+    assert ok_status == 200
+    assert seen["upload_token"] == "minted-tok"
+
+
+def test_both_mode_accepts_raw_header_without_bearer():
+    """Existing clients send `Authorization: <api token>` (no Bearer); in both
+    mode that must still reach InvoiceNinja, as it does in token mode."""
+    seen = {}
+    inner, app = make_app(True, seen)
+    factory = factory_for(app)
+
+    async def run():
+        async with inner.router.lifespan_context(inner):
+            transport = StreamableHttpTransport(
+                url="http://localhost/mcp",
+                headers={"Authorization": "raw-api-token"},
+                httpx_client_factory=factory,
+            )
+            async with Client(transport) as c:
+                await c.call_tool("getClients", {})
+
+    asyncio.run(run())
+    assert seen["token"] == "raw-api-token"
+
+
+def test_metadata_advertises_iss_parameter_support():
+    inner, app = make_app(False, {})
+
+    async def run():
+        async with inner.router.lifespan_context(inner):
+            async with factory_for(app)() as http:
+                r = await http.get("/.well-known/oauth-authorization-server")
+                return r.json()
+
+    meta = asyncio.run(run())
+    assert meta["authorization_response_iss_parameter_supported"] is True
+    assert meta["issuer"].rstrip("/") == "http://localhost"
+    assert "registration_endpoint" in meta  # untouched fields survive the rewrite
