@@ -32,7 +32,16 @@ from fastmcp import FastMCP
 from fastmcp.server.providers.openapi import MCPType, RouteMap
 from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import File
+from key_value.aio.protocols import AsyncKeyValue
+from key_value.aio.stores.filetree import (
+    FileTreeStore,
+    FileTreeV1CollectionSanitizationStrategy,
+    FileTreeV1KeySanitizationStrategy,
+)
+from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+from mcp.server.auth.routes import validate_issuer_url
 from mcp.types import TextContent
+from pydantic import AnyHttpUrl
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 
@@ -45,11 +54,26 @@ MCP_PORT_ENV = "MCP_PORT"                  # Port the MCP server listens on
 MCP_PATH_ENV = "MCP_PATH"                  # HTTP path the MCP endpoint is served at
 MCP_ALLOWED_HOSTS_ENV = "MCP_ALLOWED_HOSTS"  # comma-separated Host allowlist
 
+AUTH_MODE_ENV = "MCP_AUTH_MODE"            # token | oauth | both (see resolve_auth_mode)
+BASE_URL_ENV = "MCP_BASE_URL"              # public URL clients reach us at (OAuth issuer)
+OAUTH_SECRET_ENV = "MCP_OAUTH_SECRET"      # encrypts the OAuth store at rest
+
 DEFAULT_SERVER_URL = "http://invoiceninja:80"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8081
 DEFAULT_PATH = "/mcp"
 HEALTH_PATH = "/health"
+
+AUTH_MODES = ("token", "oauth", "both")
+OAUTH_STORE_DIR = Path("/data/oauth")      # mount a volume at /data to keep logins
+
+# OAuth (see InvoiceNinjaOAuthProvider). Issued codes/tokens carry this prefix so
+# a stale one is recognizably ours and never mistaken for a raw InvoiceNinja token.
+OAUTH_TOKEN_PREFIX = "inmcp_"
+PENDING_LOGIN_TTL = 10 * 60
+AUTH_CODE_TTL = 5 * 60
+ACCESS_TOKEN_TTL = 60 * 60
+REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60
 
 # Per-request holder for the incoming client Authorization header. Populated by
 # TokenCaptureMiddleware and read by InvoiceNinjaTokenAuth when calling InvoiceNinja.
@@ -425,6 +449,65 @@ def register_health(mcp: FastMCP) -> None:
     @mcp.custom_route(HEALTH_PATH, methods=["GET"])
     async def health(_request: Request):
         return PlainTextResponse("ok")
+
+
+def resolve_auth_mode() -> str:
+    """Pick token / oauth / both from the environment.
+
+    Unset MCP_AUTH_MODE means `both` when OAuth is configured, else `token` with
+    a warning -- so an existing deployment keeps working after an image update.
+    An explicit oauth/both without its config is an error (-> startup_error).
+    """
+    mode = os.environ.get(AUTH_MODE_ENV, "").strip().lower()
+    missing = [
+        v for v in (BASE_URL_ENV, OAUTH_SECRET_ENV) if not os.environ.get(v, "").strip()
+    ]
+    if not mode:
+        if missing:
+            print(f"OAuth disabled: {' and '.join(missing)} not set; accepting raw "
+                  f"API tokens only.", file=sys.stderr)
+            return "token"
+        return "both"
+    if mode not in AUTH_MODES:
+        raise RuntimeError(
+            f"{AUTH_MODE_ENV}={mode!r} is invalid; use one of {', '.join(AUTH_MODES)}."
+        )
+    if mode != "token" and missing:
+        raise RuntimeError(f"{AUTH_MODE_ENV}={mode} requires {' and '.join(missing)}.")
+    return mode
+
+
+def validate_base_url() -> str:
+    """MCP_BASE_URL without a trailing slash; must be a valid OAuth issuer."""
+    base_url = os.environ[BASE_URL_ENV].strip().rstrip("/")
+    try:
+        validate_issuer_url(AnyHttpUrl(base_url))
+    except ValueError as e:
+        raise RuntimeError(
+            f"{BASE_URL_ENV}={base_url!r} is not a valid OAuth issuer: {e} "
+            f"(OAuth needs HTTPS; plain http is only allowed for localhost)."
+        ) from e
+    return base_url
+
+
+def build_oauth_store() -> AsyncKeyValue:
+    """Fernet-encrypted file store under OAUTH_STORE_DIR (same pattern as
+    FastMCP's own OAuthProxy)."""
+    OAUTH_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    files = FileTreeStore(
+        data_directory=OAUTH_STORE_DIR,
+        key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(OAUTH_STORE_DIR),
+        collection_sanitization_strategy=FileTreeV1CollectionSanitizationStrategy(
+            OAUTH_STORE_DIR
+        ),
+    )
+    return FernetEncryptionWrapper(
+        key_value=files,
+        source_material=os.environ[OAUTH_SECRET_ENV],
+        salt="invoiceninja-mcp-oauth",
+        # A changed secret turns stored state into misses: clients just log in again.
+        raise_on_decryption_error=False,
+    )
 
 
 def register_upload_route(mcp: FastMCP, client: httpx.AsyncClient, spec: dict) -> None:
