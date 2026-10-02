@@ -61,6 +61,7 @@ nav:
   - Home: index.md
   - Guide:
       - Getting started: getting-started.md
+      - Connecting clients: connecting.md
       - Configuration: configuration.md
       - Security: security.md
       - Tools: tools.md
@@ -69,6 +70,7 @@ nav:
       - Architecture decisions:
           - adr/0001-load-spec-matching-instance-version.md
           - adr/0002-treat-openapi-spec-as-hints.md
+          - adr/0003-oauth-login-via-invoiceninja-password.md
   - Contributing: contributing.md
   - invoiceninja-plugin (Claude Code skills): https://invoiceninja-plugin.marceltov.de/
 

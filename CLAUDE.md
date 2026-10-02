@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A standalone MCP server that turns the [InvoiceNinja](https://invoiceninja.com) v5 REST API into MCP tools. It runs as a **container sidecar** next to an InvoiceNinja instance and exposes ~377 tools generated at startup from the OpenAPI spec matching the instance's version (379 documented operations in 5.13.43, minus `login`/`logout`), served over streamable **HTTP**. It stores no secret: each client presents its own API token in the `Authorization` header, which is forwarded per-request to InvoiceNinja as `X-API-TOKEN` (alongside a fixed `X-Requested-With: XMLHttpRequest` header).
+A standalone MCP server that turns the [InvoiceNinja](https://invoiceninja.com) v5 REST API into MCP tools. It runs as a **container sidecar** next to an InvoiceNinja instance and exposes ~377 tools generated at startup from the OpenAPI spec matching the instance's version (379 documented operations in 5.13.43, minus `login`/`logout`), served over streamable **HTTP**. In token mode it stores no secret: each client presents its own API token in the `Authorization` header, which is forwarded per-request to InvoiceNinja as `X-API-TOKEN` (alongside a fixed `X-Requested-With: XMLHttpRequest` header). In `oauth`/`both` modes it is also an OAuth authorization server whose login mints a per-client InvoiceNinja token.
 
 The entire server is one module: `app/server.py`.
 
@@ -61,14 +61,20 @@ The server holds no secret. The API token travels per-request through a contextv
 1. `TokenCaptureMiddleware` (pure-ASGI) requires an `Authorization` header on the MCP path, rejecting requests without one as `401` before FastMCP sees them. `/health` is always allowed through unauthenticated.
 2. `InvoiceNinjaTokenAuth` (an `httpx.Auth`) reads the contextvar on the outgoing InvoiceNinja call, strips a leading `Bearer ` if present, and sets it as `X-API-TOKEN`. It also sets a fixed `X-Requested-With: XMLHttpRequest` header, which InvoiceNinja's API docs describe as required.
 
+### OAuth
+
+`InvoiceNinjaOAuthProvider` (subclass of the MCP SDK `OAuthProvider`) serves discovery, DCR, `/authorize`, `/token` (PKCE), `/revoke`, plus its own `/login` form. `/login` posts email, password and optional 2FA code to InvoiceNinja `/api/v1/login`, then mints a token named `MCP: <client>` via `/api/v1/tokens` with the session token. It **never** calls `/logout` (that deletes the user's shared "User Token"). Registrations and tokens live in a Fernet-encrypted store at `/data/oauth` keyed by `MCP_OAUTH_SECRET`; OAuth bearers carry the `inmcp_` prefix. `resolve_auth_mode()` picks `token|oauth|both` (unset means `both` when `MCP_BASE_URL` and `MCP_OAUTH_SECRET` are set, else `token`) and `wrap_app()` builds the ASGI stack: in `both`, `BearerPrefixMiddleware` lets raw tokens through, `UploadAuthMiddleware` gates `/upload/{entity}/{id}`, and `IssuerFlagMiddleware` advertises `iss`. Revoke drops the OAuth pair and best-effort `DELETE /api/v1/tokens/{id}`, which only archives the token. Tests: `app/tests/test_oauth.py` and `app/tests/live/test_oauth_flow.py`. 2FA and passkey/SSO logins are untested; CIMD is unsupported (DCR only). See ADR 0003.
+
 ### Startup resilience
 
 If the OpenAPI spec can't be loaded, `main()` falls back to `build_error_server()`, which completes the MCP handshake but exposes only a `startup_error` tool describing the failure.
 
 ### Configuration
 
-All config is environment variables (no CLI args): `INVOICENINJA_SERVER_URL` (used as-is; the spec's own paths already include `/api/v1`), `MCP_HOST`, `MCP_PORT`, `MCP_PATH`, `INVOICENINJA_API_SPEC`, `MCP_ALLOWED_HOSTS`.
+All config is environment variables (no CLI args): `INVOICENINJA_SERVER_URL` (used as-is; the spec's own paths already include `/api/v1`), `MCP_HOST`, `MCP_PORT`, `MCP_PATH`, `INVOICENINJA_API_SPEC`, `MCP_ALLOWED_HOSTS`, `MCP_AUTH_MODE`, `MCP_BASE_URL`, `MCP_OAUTH_SECRET` (OAuth; see above).
 
 ## Dev fixture credentials
 
 The seeded InvoiceNinja at http://localhost:8082 uses `admin@example.com` / `invoiceninja-mcp-dev` — a **committed dev fixture credential** (set via `IN_USER_EMAIL`/`IN_PASSWORD` in `docker-compose.yaml`), scoped to the disposable instance, never reuse it anywhere real. The API token itself is *not* committed: it's minted fresh on each fixture bring-up by `scripts/mint_dev_token.py` into `invoiceninja.token` (gitignored) — unlike trillium-mcp's committed `etapi.token`, this one can't be static since a fresh container boot creates a new token.
+
+The dev compose stack also sets `MCP_BASE_URL`/`MCP_OAUTH_SECRET` for the MCP service and mounts a `mcp-oauth:/data` volume, so OAuth works against the fixture.
