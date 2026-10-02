@@ -18,6 +18,7 @@
 import base64
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -33,7 +34,7 @@ from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import File
 from mcp.types import TextContent
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 
 # All configuration comes from the environment so the server runs cleanly as a
 # container sidecar with no command-line arguments.
@@ -426,6 +427,48 @@ def register_health(mcp: FastMCP) -> None:
         return PlainTextResponse("ok")
 
 
+def register_upload_route(mcp: FastMCP, client: httpx.AsyncClient, spec: dict) -> None:
+    """Add `POST /upload/{entity}/{id}`: a plain multipart endpoint for attaching
+    files to any InvoiceNinja entity that has a `/{id}/upload` route.
+
+    MCP tools can only carry a file as base64 inside the model's own output,
+    which is impractical for a receipt photo or PDF. This route lets a client
+    send the bytes over plain HTTP instead (`curl -F documents[]=@receipt.pdf`),
+    with the same `Authorization` header the MCP endpoint needs (enforced by
+    TokenCaptureMiddleware). It forwards to InvoiceNinja the way uploadClient
+    does: a POST carrying `_method=PUT`. Only entities whose upload route is in
+    the spec are accepted.
+    """
+    entities = {
+        m.group(1)
+        for path in spec.get("paths", {})
+        if (m := re.fullmatch(r"/api/v1/([a-z_]+)/\{id\}/upload", path))
+    }
+
+    @mcp.custom_route("/upload/{entity}/{id}", methods=["POST"])
+    async def upload(request: Request):
+        entity, id_ = request.path_params["entity"], request.path_params["id"]
+        if entity not in entities or not re.fullmatch(r"[A-Za-z0-9]+", id_):
+            return JSONResponse({"error": f"cannot upload to {entity!r}/{id_!r}"}, 404)
+        form = await request.form()
+        files = [
+            ("documents[]", (f.filename, await f.read(), f.content_type))
+            for key, f in form.multi_items()
+            if key in ("documents", "documents[]") and hasattr(f, "filename")
+        ]
+        if not files:
+            return JSONResponse({"error": "send at least one file as 'documents'"}, 400)
+        response = await client.post(
+            f"/api/v1/{entity}/{id_}/upload",
+            files=[*files, ("_method", (None, "PUT"))],
+        )
+        return JSONResponse(
+            response.json() if response.headers.get("content-type", "").startswith("application/json")
+            else {"body": response.text},
+            response.status_code,
+        )
+
+
 _API_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 
 
@@ -591,6 +634,7 @@ def build_server(
         ],
     )
     register_upload_client_tool(mcp, client)
+    register_upload_route(mcp, client, spec)
     register_api_request_tool(mcp, client)
     register_health(mcp)
     return mcp

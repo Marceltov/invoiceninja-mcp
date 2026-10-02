@@ -344,3 +344,32 @@ def test_api_request_still_returns_text_and_json_as_data():
     result = _api_request(lambda r: httpx.Response(200, text="pong"),
                           {"method": "GET", "path": "/api/v1/ping"})
     assert result.structured_content == {"status": 200, "body": "pong"}
+
+
+def test_upload_route_forwards_file_as_spoofed_put():
+    from starlette.testclient import TestClient
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/expenses/exp123/upload":
+            captured["body"] = request.content
+            return httpx.Response(200, json={"data": {"id": "exp123"}})
+        return httpx.Response(404, json={"message": "not found"})
+
+    mock = httpx.AsyncClient(
+        base_url="http://invoiceninja:80",
+        auth=server.InvoiceNinjaTokenAuth(),
+        transport=httpx.MockTransport(handler),
+    )
+    app = server.TokenCaptureMiddleware(server.build_server(client=mock).http_app())
+    http = TestClient(app)
+    ok = http.post("/upload/expenses/exp123", headers={"Authorization": "tok"},
+                   files={"documents": ("receipt.pdf", b"%PDF-bytes", "application/pdf")})
+    assert ok.status_code == 200
+    assert b"%PDF-bytes" in captured["body"] and b"receipt.pdf" in captured["body"]
+    assert b'name="_method"' in captured["body"]
+    # no token -> rejected by the middleware; unknown entity -> 404
+    assert http.post("/upload/expenses/exp123", files={"documents": ("a", b"x")}).status_code == 401
+    assert http.post("/upload/nope/exp123", headers={"Authorization": "tok"},
+                     files={"documents": ("a", b"x")}).status_code == 404

@@ -29,5 +29,14 @@ The spec documents `POST /clients/{id}/upload` with binary multipart parts, whic
 | `filename` | Name to store the file under; the type is inferred from the extension. |
 | `content_base64` | Base64-encoded file contents. |
 
-!!! note
-    The other 15 `/{id}/upload` endpoints (invoices, expenses, …) are not yet fixed; only `uploadClient` is verified against a real instance. Use `apiRequest` or see [Contributing](contributing.md).
+## File upload route: `POST /upload/{entity}/{id}`
+
+A plain HTTP endpoint (not an MCP tool) for attaching files to any entity that has a `/{id}/upload` route in the spec: `expenses`, `invoices`, `quotes`, `payments`, `vendors`, … Base64 inside a tool call is impractical for a receipt photo or PDF, so send the bytes directly. It needs the same `Authorization` header as the MCP endpoint, is served next to it (same host and port), and forwards the files to InvoiceNinja the way `uploadClient` does.
+
+```bash
+curl -X POST "http://localhost:8081/upload/expenses/EXPENSE_ID" \
+  -H "Authorization: YOUR_INVOICENINJA_API_TOKEN" \
+  -F "documents=@receipt.pdf"
+```
+
+Several `documents` parts attach several files. It returns InvoiceNinja's response; an unknown entity answers `404`, no file `400`, a missing header `401`.
