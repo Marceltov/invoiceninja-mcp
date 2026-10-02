@@ -1,6 +1,6 @@
 site_name: InvoiceNinja MCP
 site_description: A standalone MCP server that exposes the InvoiceNinja v5 REST API as MCP tools.
-site_url: https://marceltov.github.io/invoiceninja-mcp/
+site_url: https://invoiceninja-mcp.marceltov.de/
 repo_url: https://github.com/Marceltov/invoiceninja-mcp
 repo_name: Marceltov/invoiceninja-mcp
 edit_uri: edit/main/docs/
