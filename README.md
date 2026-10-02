@@ -98,7 +98,7 @@ If the OpenAPI spec cannot be loaded at startup, the server still starts and com
 
 ## How it works
 
-`TokenCaptureMiddleware` requires an `Authorization` header on the MCP path (stripping an optional `Bearer ` prefix) and stashes it in a contextvar; `InvoiceNinjaTokenAuth` reads it on the outgoing call and sets it as `X-API-TOKEN`, alongside a fixed `X-Requested-With: XMLHttpRequest` header. Validity is enforced by InvoiceNinja itself — this server never validates an API token. In `oauth`/`both` modes an OAuth login with the user's InvoiceNinja email and password mints a per-client token (`MCP: <client>`) that is forwarded the same way.
+`TokenCaptureMiddleware` requires an `Authorization` header on the MCP path and stashes it in a contextvar; `InvoiceNinjaTokenAuth` reads it on the outgoing call, strips a leading `Bearer ` if present, and sets it as `X-API-TOKEN`, alongside a fixed `X-Requested-With: XMLHttpRequest` header. Validity is enforced by InvoiceNinja itself — this server never validates an API token. In `oauth`/`both` modes an OAuth login with the user's InvoiceNinja email and password mints a per-client token (`MCP: <client>`) that is forwarded the same way.
 
 ## Contributing
 

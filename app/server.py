@@ -237,7 +237,9 @@ def _invoiceninja_error(response: httpx.Response) -> str:
         message = response.json().get("message")
     except (ValueError, AttributeError):
         message = None
-    return message or f"InvoiceNinja rejected the request (HTTP {response.status_code})."
+    if isinstance(message, str) and message:
+        return message
+    return f"InvoiceNinja rejected the request (HTTP {response.status_code})."
 
 
 class InvoiceNinjaOAuthProvider(OAuthProvider):
@@ -478,7 +480,10 @@ class InvoiceNinjaOAuthProvider(OAuthProvider):
         client = await self.get_client(pending["client_id"])
         client_name = (client.client_name if client else None) or pending["client_id"]
         redirect = str(params.redirect_uri)
-        page = (pending_id, client_name, urlsplit(redirect).netloc or redirect)
+        u = urlsplit(redirect)
+        # Show the real host: netloc would include spoofable userinfo (claude.ai@evil).
+        host = u.hostname and (f"{u.hostname}:{u.port}" if u.port else u.hostname)
+        page = (pending_id, client_name, host or redirect)
         if request.method == "GET":
             return _login_page(*page)
 

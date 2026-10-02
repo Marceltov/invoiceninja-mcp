@@ -64,6 +64,7 @@ def test_encrypted_store_round_trips(monkeypatch, tmp_path):
 import json
 
 import httpx
+from pydantic import AnyUrl
 from key_value.aio.stores.memory import MemoryStore
 from mcp.shared.auth import OAuthClientInformationFull
 
@@ -226,15 +227,18 @@ from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
 
-def begin_login(p, client_name="itest"):
+def begin_login(p, client_name="itest", redirect=None):
     """Register CLIENT and start an authorize -> returns the pending login id."""
-    client = CLIENT.model_copy(update={"client_name": client_name})
+    update = {"client_name": client_name}
+    if redirect:
+        update["redirect_uris"] = [AnyUrl(redirect)]
+    client = CLIENT.model_copy(update=update)
 
     async def go():
         await p.register_client(client)
         url = await p.authorize(client, AuthorizationParams(
             state="s1", scopes=[], code_challenge="x" * 43,
-            redirect_uri="http://localhost:9/cb", redirect_uri_provided_explicitly=True,
+            redirect_uri=redirect or "http://localhost:9/cb", redirect_uri_provided_explicitly=True,
         ))
         return httpx.URL(url).params["id"]
 
@@ -244,6 +248,13 @@ def begin_login(p, client_name="itest"):
 def login_client(p):
     return TestClient(Starlette(routes=p.get_routes(server.DEFAULT_PATH)),
                       follow_redirects=False)
+
+
+def test_login_page_shows_real_redirect_host_not_userinfo():
+    p, _ = make_provider()
+    pid = begin_login(p, redirect="https://claude.ai@evil.example:8443/cb")
+    page = login_client(p).get("/login", params={"id": pid})
+    assert "evil.example:8443" in page.text and "claude.ai@" not in page.text
 
 
 def test_login_page_shows_client_and_redirect_host_escaped():
@@ -312,6 +323,8 @@ def test_one_time_password_is_forwarded_only_when_given():
         httpx.Response(200, json={"data": []}),                 # user in no company
         httpx.Response(502, text="<html>bad gateway</html>"),   # not JSON
         httpx.Response(200, text="not json"),
+        httpx.Response(400, json={"message": {"email": ["bad"]}}),  # non-string message
+        httpx.Response(400, json={"message": ["x"]}),
     ],
 )
 def test_unexpected_login_answers_show_an_error_not_a_500(response):
