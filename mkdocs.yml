@@ -1,0 +1,66 @@
+site_name: InvoiceNinja MCP
+site_description: A standalone MCP server that exposes the InvoiceNinja v5 REST API as MCP tools.
+site_url: https://invoiceninja-mcp.marceltov.de/
+repo_url: https://github.com/Marceltov/invoiceninja-mcp
+repo_name: Marceltov/invoiceninja-mcp
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Guide:
+      - Getting started: getting-started.md
+      - Configuration: configuration.md
+      - Security: security.md
+      - Tools: tools.md
+  - Reference:
+      - How it works: how-it-works.md
+      - Architecture decisions:
+          - adr/0001-load-spec-matching-instance-version.md
+          - adr/0002-treat-openapi-spec-as-hints.md
+  - Contributing: contributing.md
