@@ -6,11 +6,11 @@ InvoiceNinja's published API spec is inaccurate in places (missing fields, wrong
 
 ## Architecture
 
-**invoiceninja-mcp** (this repo) runs as a container sidecar and talks to InvoiceNinja over the internal Docker network, so InvoiceNinja's API is never exposed publicly on its own. Clients reach invoiceninja-mcp either through a TLS-terminating reverse proxy or directly over a trusted LAN — in both cases the API token they present is the only credential.
+**invoiceninja-mcp** (this repo) runs as a container sidecar and talks to InvoiceNinja over the internal Docker network, so InvoiceNinja's API is never exposed publicly on its own. Clients reach invoiceninja-mcp either through a TLS-terminating reverse proxy or directly over a trusted LAN — in both cases the credential they present (an API token, or an OAuth login that mints one) is what InvoiceNinja checks.
 
 ## Quick start
 
-**1. Create an API token in InvoiceNinja** — *Settings → Account Management → Integrations → API tokens*. This token is the only credential: invoiceninja-mcp stores no secret and forwards it to InvoiceNinja as `X-API-TOKEN` (alongside a required `X-Requested-With: XMLHttpRequest` header). Each client presents its own token per request.
+**1. Create an API token in InvoiceNinja** — *Settings → Account Management → Integrations → API tokens*. In token mode this is the only credential: invoiceninja-mcp stores no secret and forwards it to InvoiceNinja as `X-API-TOKEN` (alongside a required `X-Requested-With: XMLHttpRequest` header). Each client presents its own token per request.
 
 **2. Add invoiceninja-mcp to your InvoiceNinja's `docker-compose.yaml`** — one service, pulling the prebuilt image, so there's nothing to clone or build:
 
@@ -66,6 +66,11 @@ All configuration is via environment variables:
 | `MCP_PATH` | `/mcp` | HTTP path the MCP endpoint is served at. |
 | `INVOICENINJA_API_SPEC` | *(unset)* | Path to a fixed OpenAPI spec file; skips the version-matched download (see below). |
 | `MCP_ALLOWED_HOSTS` | *(unset = any)* | Comma-separated `Host` allowlist (DNS-rebinding protection). |
+| `MCP_AUTH_MODE` | *(unset)* | `token`, `oauth` or `both`. Unset means `both` when `MCP_BASE_URL` and `MCP_OAUTH_SECRET` are set, else `token`. |
+| `MCP_BASE_URL` | *(unset)* | Public HTTPS URL clients use to reach the server (the OAuth issuer). `localhost` may use http. |
+| `MCP_OAUTH_SECRET` | *(unset)* | Any long random string. Encrypts the OAuth store at rest at `/data/oauth`. Changing it logs every client out. |
+
+OAuth login (so app clients connect with only the URL) additionally needs a `/data` volume; see the [docs](https://invoiceninja-mcp.marceltov.de/connecting/).
 
 ### Which API spec is used
 
@@ -83,7 +88,7 @@ your-host {
 
 ## Security
 
-The MCP endpoint grants **full access to your InvoiceNinja account** — whatever the token's permissions allow. Every request must carry a valid API token in the `Authorization` header; requests with no `Authorization` header at all are rejected with `401` before reaching any tool. The server never validates the token itself — validity is enforced by InvoiceNinja when the forwarded request reaches the actual API call, and the server holds no secret of its own. The `/health` endpoint is always unauthenticated (used by the container healthcheck).
+The MCP endpoint grants **full access to your InvoiceNinja account** — whatever the token's permissions allow. Every request must carry a valid API token in the `Authorization` header; requests with no `Authorization` header at all are rejected with `401` before reaching any tool. The server never validates the token itself — validity is enforced by InvoiceNinja when the forwarded request reaches the actual API call, and in token mode the server holds no secret of its own (in `oauth`/`both` modes it stores OAuth registrations and the tokens it minted, encrypted at rest). The `/health` endpoint is always unauthenticated (used by the container healthcheck).
 
 The token is sent as `X-API-TOKEN` (alongside `X-Requested-With: XMLHttpRequest`) on every call. Over plain HTTP it travels in cleartext, so either keep traffic on a **trusted network** (e.g. a LAN or the Docker network) or put TLS in front.
 
@@ -93,7 +98,7 @@ If the OpenAPI spec cannot be loaded at startup, the server still starts and com
 
 ## How it works
 
-`TokenCaptureMiddleware` requires an `Authorization` header on the MCP path (stripping an optional `Bearer ` prefix) and stashes it in a contextvar; `InvoiceNinjaTokenAuth` reads it on the outgoing call and sets it as `X-API-TOKEN`, alongside a fixed `X-Requested-With: XMLHttpRequest` header. Validity is enforced by InvoiceNinja itself — this server never validates the token.
+`TokenCaptureMiddleware` requires an `Authorization` header on the MCP path and stashes it in a contextvar; `InvoiceNinjaTokenAuth` reads it on the outgoing call, strips a leading `Bearer ` if present, and sets it as `X-API-TOKEN`, alongside a fixed `X-Requested-With: XMLHttpRequest` header. Validity is enforced by InvoiceNinja itself — this server never validates an API token. In `oauth`/`both` modes an OAuth login with the user's InvoiceNinja email and password mints a per-client token (`MCP: <client>`) that is forwarded the same way.
 
 ## Contributing
 

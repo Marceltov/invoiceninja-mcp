@@ -2,7 +2,7 @@
 
 ## 1. Create an API token
 
-In InvoiceNinja go to *Settings → Account Management → Integrations → API tokens*. This is the only credential: the server stores no secret and forwards your token to InvoiceNinja as `X-API-TOKEN`. Each client presents its own token per request.
+In InvoiceNinja go to *Settings → Account Management → Integrations → API tokens*. This is the only credential in token mode: the server stores no secret and forwards your token to InvoiceNinja as `X-API-TOKEN`. Each client presents its own token per request.
 
 ## 2. Add the sidecar
 
@@ -40,6 +40,10 @@ claude mcp add invoiceninja --scope user --transport http \
 ```
 
 `--scope user` registers the server across all your projects; drop it for the default local scope. Or use the repo's [`.mcp.json`](https://github.com/Marceltov/invoiceninja-mcp/blob/main/.mcp.json), filling in host and token.
+
+## Optional: OAuth login
+
+To connect app clients such as claude.ai or ChatGPT with just the URL, enable OAuth: set `MCP_BASE_URL`, `MCP_OAUTH_SECRET` and a `/data` volume as described in [Configuration](configuration.md#oauth), then follow [Connecting clients](connecting.md).
 
 ## TLS / reverse proxy
 

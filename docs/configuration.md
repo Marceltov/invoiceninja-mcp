@@ -10,6 +10,28 @@ All configuration is via environment variables.
 | `MCP_PATH` | `/mcp` | HTTP path the MCP endpoint is served at. |
 | `INVOICENINJA_API_SPEC` | *(unset)* | Path to a fixed OpenAPI spec file; skips the version-matched download. |
 | `MCP_ALLOWED_HOSTS` | *(unset = any)* | Comma-separated `Host` allowlist (DNS-rebinding protection). |
+| `MCP_AUTH_MODE` | *(unset)* | `token`, `oauth` or `both`. Unset means `both` when `MCP_BASE_URL` and `MCP_OAUTH_SECRET` are set, else `token`. |
+| `MCP_BASE_URL` | *(unset)* | Public HTTPS URL clients use to reach the server (the OAuth issuer). `localhost` may use http. |
+| `MCP_OAUTH_SECRET` | *(unset)* | Any long random string. Encrypts the OAuth store at rest at `/data/oauth`. Changing it logs every client out. |
+
+## OAuth
+
+To let app clients log in with OAuth, give the server a public HTTPS URL, a secret, and a volume for its store:
+
+```yaml
+services:
+  invoiceninja-mcp:
+    environment:
+      MCP_BASE_URL: https://invoiceninja-mcp.example.com
+      MCP_OAUTH_SECRET: <openssl rand -hex 32>
+    volumes:
+      - mcp-oauth:/data
+
+volumes:
+  mcp-oauth:
+```
+
+With both variables set the mode defaults to `both`: OAuth clients and raw-token clients work side by side. Set `MCP_AUTH_MODE=oauth` to refuse raw tokens, or `token` to turn OAuth off. See [Connecting clients](connecting.md) and [Security](security.md).
 
 ## Which API spec is used
 

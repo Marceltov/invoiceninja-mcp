@@ -16,25 +16,49 @@
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import base64
+import html
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import traceback
 from contextvars import ContextVar
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
 import yaml
 from fastmcp import FastMCP
+from fastmcp.server.auth import AccessToken, OAuthProvider
+from fastmcp.server.auth.auth import ClientRegistrationOptions, RevocationOptions
+from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.providers.openapi import MCPType, RouteMap
 from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import File
+from key_value.aio.protocols import AsyncKeyValue
+from key_value.aio.stores.filetree import (
+    FileTreeStore,
+    FileTreeV1CollectionSanitizationStrategy,
+    FileTreeV1KeySanitizationStrategy,
+)
+from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+from mcp.server.auth.provider import (
+    AuthorizationCode,
+    AuthorizationParams,
+    RefreshToken,
+    TokenError,
+    construct_redirect_uri,
+)
+from mcp.server.auth.routes import validate_issuer_url
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mcp.types import TextContent
+from pydantic import AnyHttpUrl
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from starlette.routing import Route
 
 # All configuration comes from the environment so the server runs cleanly as a
 # container sidecar with no command-line arguments.
@@ -45,11 +69,26 @@ MCP_PORT_ENV = "MCP_PORT"                  # Port the MCP server listens on
 MCP_PATH_ENV = "MCP_PATH"                  # HTTP path the MCP endpoint is served at
 MCP_ALLOWED_HOSTS_ENV = "MCP_ALLOWED_HOSTS"  # comma-separated Host allowlist
 
+AUTH_MODE_ENV = "MCP_AUTH_MODE"            # token | oauth | both (see resolve_auth_mode)
+BASE_URL_ENV = "MCP_BASE_URL"              # public URL clients reach us at (OAuth issuer)
+OAUTH_SECRET_ENV = "MCP_OAUTH_SECRET"      # encrypts the OAuth store at rest
+
 DEFAULT_SERVER_URL = "http://invoiceninja:80"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8081
 DEFAULT_PATH = "/mcp"
 HEALTH_PATH = "/health"
+
+AUTH_MODES = ("token", "oauth", "both")
+OAUTH_STORE_DIR = Path("/data/oauth")      # mount a volume at /data to keep logins
+
+# OAuth (see InvoiceNinjaOAuthProvider). Issued codes/tokens carry this prefix so
+# a stale one is recognizably ours and never mistaken for a raw InvoiceNinja token.
+OAUTH_TOKEN_PREFIX = "inmcp_"
+PENDING_LOGIN_TTL = 10 * 60
+AUTH_CODE_TTL = 5 * 60
+ACCESS_TOKEN_TTL = 60 * 60
+REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60
 
 # Per-request holder for the incoming client Authorization header. Populated by
 # TokenCaptureMiddleware and read by InvoiceNinjaTokenAuth when calling InvoiceNinja.
@@ -68,10 +107,15 @@ class InvoiceNinjaTokenAuth(httpx.Auth):
     it: InvoiceNinja's developer docs describe it as required security-minded
     header on API calls, and sending it costs nothing on requests where it
     turns out not to be enforced.
+
+    With OAuth (see InvoiceNinjaOAuthProvider), FastMCP's request-scoped access
+    token carries the API token in `claims["api_token"]`; otherwise it is the
+    raw client header.
     """
 
     def auth_flow(self, request: httpx.Request):
-        raw = _incoming_auth.get()
+        access = get_access_token()
+        raw = access.claims.get("api_token") if access else _incoming_auth.get()
         if raw and raw[:7].lower() == "bearer ":
             raw = raw[7:].strip()
         if not raw:
@@ -134,6 +178,384 @@ class TokenCaptureMiddleware:
             await self.app(scope, receive, send)
         finally:
             _incoming_auth.reset(token)
+
+
+def _page(inner: str, status: int = 200) -> HTMLResponse:
+    """Minimal standalone HTML page for the login flow."""
+    body = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>InvoiceNinja MCP login</title><style>body{font-family:system-ui,"
+        "sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.5}"
+        "input,button{font:inherit;padding:.4rem;margin:.3rem 0;width:100%;"
+        f"box-sizing:border-box}}</style></head><body><h1>InvoiceNinja MCP</h1>{inner}"
+        "</body></html>"
+    )
+    # DENY framing so the password form can't be clickjacked.
+    return HTMLResponse(body, status_code=status, headers={"X-Frame-Options": "DENY"})
+
+
+def _login_page(pending_id, client_name, redirect_host, error="", status=200):
+    """The one page a human sees: who is asking, where the code goes, credentials."""
+    e = html.escape
+    err = f'<p style="color:#b00">{e(error)}</p>' if error else ""
+    return _page(
+        f"{err}<p><b>{e(client_name)}</b> wants access to your InvoiceNinja account. "
+        f"After login you will be sent to <b>{e(redirect_host)}</b>. Only continue "
+        f"if you started this.</p>"
+        f'<form method="post"><input type="hidden" name="id" value="{e(pending_id)}">'
+        f'<label>Email <input type="email" name="email" autofocus required></label>'
+        f'<label>Password <input type="password" name="password" required></label>'
+        f'<label>2FA code (only if enabled) <input name="one_time_password" '
+        f'autocomplete="one-time-code" inputmode="numeric"></label>'
+        f"<button>Authorize</button></form>",
+        status,
+    )
+
+
+def _dead_end_page(heading: str, what: str, status: int) -> HTMLResponse:
+    """A login that can't continue from here. The usual cause is the MCP app
+    interrupting its own OAuth flow -- claude.ai asking the user to log in to
+    claude.ai partway through, then dropping the finished login -- so say that,
+    say it isn't the server's fault, and give the fix."""
+    return _page(
+        f"<h2>{html.escape(heading)}</h2><p>{html.escape(what)}</p>"
+        "<p><b>Why:</b> your app interrupted its own login. Most often it asked "
+        "you to log in to the app itself (for example claude.ai) partway through, "
+        "then lost track of this login. Nothing is wrong with your InvoiceNinja or "
+        "this MCP server.</p>"
+        "<p><b>Fix:</b> go back to your app and remove this connector and add it "
+        "again, or use its Reconnect / Authenticate button. Being logged in to "
+        "the app first avoids the interruption.</p>",
+        status,
+    )
+
+
+def _invoiceninja_error(response: httpx.Response) -> str:
+    """A human sentence for a failed InvoiceNinja call."""
+    try:
+        message = response.json().get("message")
+    except (ValueError, AttributeError):
+        message = None
+    if isinstance(message, str) and message:
+        return message
+    return f"InvoiceNinja rejected the request (HTTP {response.status_code})."
+
+
+class InvoiceNinjaOAuthProvider(OAuthProvider):
+    """OAuth 2.1 authorization server whose login is the InvoiceNinja password.
+
+    FastMCP/the MCP SDK serve discovery, dynamic client registration,
+    /authorize, /token (PKCE) and /revoke on top of these methods. Logging in
+    (see _login, added alongside) mints a per-client InvoiceNinja API token;
+    every code and token we issue maps to it, and verify_token hands it to
+    InvoiceNinjaTokenAuth through the access token's `api_token` claim.
+
+    `passthrough` is `both` mode: a bearer that isn't one of ours is forwarded
+    to InvoiceNinja as a raw API token, exactly as in `token` mode.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        store: AsyncKeyValue,
+        api: httpx.AsyncClient,
+        passthrough: bool,
+        mcp_path: str = DEFAULT_PATH,
+    ):
+        super().__init__(
+            base_url=base_url,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+            revocation_options=RevocationOptions(enabled=True),
+        )
+        self.store = store
+        self.api = api  # unauthenticated: only /api/v1/login and /api/v1/tokens
+        self.passthrough = passthrough
+        self.mcp_path = mcp_path
+
+    def _resource_ok(self, resource: str | None) -> bool:
+        """RFC 8707 audience check: a token bound to some other server is not ours.
+        Clients that sent no `resource` are accepted."""
+        if not resource:
+            return True
+        base = str(self.base_url).rstrip("/")
+        return resource.rstrip("/") in {base, base + self.mcp_path.rstrip("/")}
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        data = await self.store.get(client_id, collection="clients")
+        return OAuthClientInformationFull.model_validate(data) if data else None
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        await self.store.put(
+            client_info.client_id,
+            client_info.model_dump(mode="json"),
+            collection="clients",
+        )
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        pending_id = secrets.token_urlsafe(32)
+        await self.store.put(
+            pending_id,
+            {"client_id": client.client_id, "params": params.model_dump(mode="json")},
+            collection="pending",
+            ttl=PENDING_LOGIN_TTL,
+        )
+        return f"{str(self.base_url).rstrip('/')}/login?id={pending_id}"
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        data = await self.store.get(authorization_code, collection="codes")
+        if not data or data["code"]["client_id"] != client.client_id:
+            return None
+        return AuthorizationCode.model_validate(data["code"])
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        data = await self.store.get(authorization_code.code, collection="codes")
+        if not data:
+            raise TokenError("invalid_grant", "Authorization code not found or already used.")
+        await self.store.delete(authorization_code.code, collection="codes")
+        return await self._issue(
+            client.client_id,
+            authorization_code.scopes,
+            data["api_token"],
+            data["token_id"],
+            authorization_code.resource,
+        )
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        data = await self.store.get(refresh_token, collection="refresh")
+        if not data or data["client_id"] != client.client_id:
+            return None
+        return RefreshToken(
+            token=refresh_token,
+            client_id=data["client_id"],
+            scopes=data["scopes"],
+            expires_at=data["expires_at"],
+        )
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        data = await self.store.get(refresh_token.token, collection="refresh")
+        if not data:
+            raise TokenError("invalid_grant", "Refresh token not found or already used.")
+        if not set(scopes) <= set(refresh_token.scopes):
+            raise TokenError("invalid_scope", "Requested scopes exceed the original grant.")
+        # Rotate: the old pair dies, the minted API token lives on in the new one.
+        await self._drop(data["access"], refresh_token.token)
+        return await self._issue(
+            client.client_id,
+            scopes or refresh_token.scopes,
+            data["api_token"],
+            data["token_id"],
+            data.get("resource"),
+        )
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        data = await self.store.get(token, collection="access")
+        if not data or not self._resource_ok(data.get("resource")):
+            return None
+        return AccessToken(
+            token=token,
+            client_id=data["client_id"],
+            scopes=data["scopes"],
+            expires_at=data["expires_at"],
+            claims={"api_token": data["api_token"]},
+        )
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        found = await self.load_access_token(token)
+        if found or not self.passthrough or token.startswith(OAUTH_TOKEN_PREFIX):
+            return found
+        # `both` mode: not ours, so it's a raw API token; InvoiceNinja judges it.
+        return AccessToken(
+            token=token, client_id="api-token", scopes=[],
+            claims={"api_token": token},
+        )
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        if isinstance(token, RefreshToken):
+            data = await self.store.get(token.token, collection="refresh")
+            pair = (data["access"], token.token) if data else None
+        else:
+            data = await self.store.get(token.token, collection="access")
+            pair = (token.token, data["refresh"]) if data else None
+        if not pair:
+            return
+        await self._drop(*pair)
+        # Also delete the minted token in InvoiceNinja. Best effort: the OAuth
+        # pair is already gone, so a failure only leaves a stray, named token.
+        # Never /logout: that would kill the user's shared session token.
+        if data.get("token_id"):
+            try:
+                await self.api.delete(
+                    f"/api/v1/tokens/{data['token_id']}",
+                    headers={"X-API-TOKEN": data["api_token"]},
+                )
+            except httpx.HTTPError:
+                pass
+
+    async def _issue(
+        self,
+        client_id: str,
+        scopes: list[str],
+        api_token: str,
+        token_id: str | None,
+        resource: str | None,
+    ) -> OAuthToken:
+        access = OAUTH_TOKEN_PREFIX + secrets.token_urlsafe(32)
+        refresh = OAUTH_TOKEN_PREFIX + secrets.token_urlsafe(32)
+        now = int(time.time())
+        common = {
+            "client_id": client_id, "scopes": scopes, "api_token": api_token,
+            "token_id": token_id, "resource": resource,
+        }
+        await self.store.put(
+            access,
+            {**common, "refresh": refresh, "expires_at": now + ACCESS_TOKEN_TTL},
+            collection="access",
+            ttl=ACCESS_TOKEN_TTL,
+        )
+        # ponytail: a client that never comes back leaves its minted token in
+        # InvoiceNinja after this TTL; delete it there by hand (Settings -> API
+        # tokens), or add a sweeper over expired refresh entries if that grows.
+        await self.store.put(
+            refresh,
+            {**common, "access": access, "expires_at": now + REFRESH_TOKEN_TTL},
+            collection="refresh",
+            ttl=REFRESH_TOKEN_TTL,
+        )
+        return OAuthToken(
+            access_token=access,
+            token_type="Bearer",
+            expires_in=ACCESS_TOKEN_TTL,
+            refresh_token=refresh,
+            scope=" ".join(scopes) or None,
+        )
+
+    async def _drop(self, access: str, refresh: str) -> None:
+        await self.store.delete(access, collection="access")
+        await self.store.delete(refresh, collection="refresh")
+
+    def get_routes(self, mcp_path: str | None = None) -> list[Route]:
+        return [
+            *super().get_routes(mcp_path),
+            Route("/login", self._login, methods=["GET", "POST"]),
+        ]
+
+    async def _login(self, request: Request):
+        form = await request.form() if request.method == "POST" else request.query_params
+        pending_id = form.get("id", "")
+        pending = (
+            await self.store.get(pending_id, collection="pending") if pending_id else None
+        )
+        if not pending:
+            return _dead_end_page(
+                "Login link expired or already used",
+                "Login links work once, for 10 minutes.",
+                400,
+            )
+        if pending.get("done"):
+            # A browser re-submitted a login that already succeeded (seen with
+            # claude.ai's connector flow). Mint nothing; say what happened.
+            return _dead_end_page(
+                "Login already completed",
+                "Your login was accepted and finished a moment ago; the browser "
+                "sent the form a second time. If your app now shows the connector "
+                "without tools, it dropped that finished login.",
+                200,
+            )
+        params = AuthorizationParams.model_validate(pending["params"])
+        client = await self.get_client(pending["client_id"])
+        client_name = (client.client_name if client else None) or pending["client_id"]
+        redirect = str(params.redirect_uri)
+        u = urlsplit(redirect)
+        # Show the real host: netloc would include spoofable userinfo (claude.ai@evil).
+        host = u.hostname and (f"{u.hostname}:{u.port}" if u.port else u.hostname)
+        page = (pending_id, client_name, host or redirect)
+        if request.method == "GET":
+            return _login_page(*page)
+
+        def failed(message: str):
+            return _login_page(*page, error=message, status=401)
+
+        # The password goes straight to InvoiceNinja and is never stored or logged.
+        credentials = {"email": form.get("email", ""), "password": form.get("password", "")}
+        if form.get("one_time_password"):
+            credentials["one_time_password"] = form["one_time_password"]
+        try:
+            login = await self.api.post("/api/v1/login", json=credentials)
+        except httpx.HTTPError as e:
+            return failed(f"Could not reach InvoiceNinja: {e.__class__.__name__}.")
+        if not login.is_success:
+            return failed(_invoiceninja_error(login))
+        try:
+            data = login.json()["data"]
+            entry = data[0] if isinstance(data, list) else data
+            session_token = entry["token"]["token"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            return failed("InvoiceNinja returned no company to log in to.")
+
+        # Mint a dedicated, named token so each client is visible and revocable in
+        # InvoiceNinja. The session token is dropped WITHOUT /logout: it is the
+        # user's shared "User Token" and logging out would invalidate it.
+        name = f"MCP: {client_name}"[:100]
+        try:
+            minted = await self.api.post(
+                "/api/v1/tokens", json={"name": name},
+                headers={"X-API-TOKEN": session_token},
+            )
+        except httpx.HTTPError as e:
+            return failed(f"Could not reach InvoiceNinja: {e.__class__.__name__}.")
+        if not minted.is_success:
+            return failed(_invoiceninja_error(minted))
+        try:
+            token = minted.json()["data"]
+            api_token, token_id = token["token"], token["id"]
+        except (ValueError, KeyError, TypeError):
+            return failed("InvoiceNinja did not return the new API token.")
+
+        # Keep a short-lived marker instead of deleting, so a replayed form gets
+        # an honest answer (see above) rather than "expired".
+        await self.store.put(
+            pending_id, {"done": True}, collection="pending", ttl=PENDING_LOGIN_TTL
+        )
+        code = AuthorizationCode(
+            code=OAUTH_TOKEN_PREFIX + secrets.token_urlsafe(32),
+            client_id=pending["client_id"],
+            scopes=params.scopes or [],
+            expires_at=time.time() + AUTH_CODE_TTL,
+            code_challenge=params.code_challenge,
+            redirect_uri=params.redirect_uri,
+            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+            resource=params.resource,
+        )
+        await self.store.put(
+            code.code,
+            {"code": code.model_dump(mode="json"), "api_token": api_token,
+             "token_id": token_id},
+            collection="codes",
+            ttl=AUTH_CODE_TTL,
+        )
+        # RFC 9207: tell the client which authorization server answered.
+        return RedirectResponse(
+            construct_redirect_uri(
+                redirect, code=code.code, state=params.state,
+                iss=str(self.base_url).rstrip("/"),
+            ),
+            status_code=302,
+        )
 
 
 # The InvoiceNinja OpenAPI spec ships alongside this server (baked into the
@@ -427,6 +849,80 @@ def register_health(mcp: FastMCP) -> None:
         return PlainTextResponse("ok")
 
 
+def resolve_auth_mode() -> str:
+    """Pick token / oauth / both from the environment.
+
+    Unset MCP_AUTH_MODE means `both` when OAuth is configured, else `token` with
+    a warning -- so an existing deployment keeps working after an image update.
+    An explicit oauth/both without its config is an error (-> startup_error).
+    """
+    mode = os.environ.get(AUTH_MODE_ENV, "").strip().lower()
+    missing = [
+        v for v in (BASE_URL_ENV, OAUTH_SECRET_ENV) if not os.environ.get(v, "").strip()
+    ]
+    if not mode:
+        if missing:
+            print(f"OAuth disabled: {' and '.join(missing)} not set; accepting raw "
+                  f"API tokens only.", file=sys.stderr)
+            return "token"
+        return "both"
+    if mode not in AUTH_MODES:
+        raise RuntimeError(
+            f"{AUTH_MODE_ENV}={mode!r} is invalid; use one of {', '.join(AUTH_MODES)}."
+        )
+    if mode != "token" and missing:
+        raise RuntimeError(f"{AUTH_MODE_ENV}={mode} requires {' and '.join(missing)}.")
+    return mode
+
+
+def validate_base_url() -> str:
+    """MCP_BASE_URL without a trailing slash; must be a valid OAuth issuer."""
+    base_url = os.environ[BASE_URL_ENV].strip().rstrip("/")
+    try:
+        validate_issuer_url(AnyHttpUrl(base_url))
+    except ValueError as e:
+        raise RuntimeError(
+            f"{BASE_URL_ENV}={base_url!r} is not a valid OAuth issuer: {e} "
+            f"(OAuth needs HTTPS; plain http is only allowed for localhost)."
+        ) from e
+    return base_url
+
+
+def build_oauth_store() -> AsyncKeyValue:
+    """Fernet-encrypted file store under OAUTH_STORE_DIR (same pattern as
+    FastMCP's own OAuthProxy)."""
+    OAUTH_STORE_DIR.mkdir(parents=True, exist_ok=True)
+    files = FileTreeStore(
+        data_directory=OAUTH_STORE_DIR,
+        key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(OAUTH_STORE_DIR),
+        collection_sanitization_strategy=FileTreeV1CollectionSanitizationStrategy(
+            OAUTH_STORE_DIR
+        ),
+    )
+    return FernetEncryptionWrapper(
+        key_value=files,
+        source_material=os.environ[OAUTH_SECRET_ENV],
+        salt="invoiceninja-mcp-oauth",
+        # A changed secret turns stored state into misses: clients just log in again.
+        raise_on_decryption_error=False,
+    )
+
+
+def build_oauth_provider(mode: str) -> InvoiceNinjaOAuthProvider:
+    server_url = os.environ.get(SERVER_ENV, DEFAULT_SERVER_URL).rstrip("/")
+    return InvoiceNinjaOAuthProvider(
+        base_url=validate_base_url(),
+        store=build_oauth_store(),
+        api=httpx.AsyncClient(
+            base_url=server_url,
+            headers={"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"},
+            timeout=60,
+        ),
+        passthrough=mode == "both",
+        mcp_path=os.environ.get(MCP_PATH_ENV, DEFAULT_PATH),
+    )
+
+
 def register_upload_route(mcp: FastMCP, client: httpx.AsyncClient, spec: dict) -> None:
     """Add `POST /upload/{entity}/{id}`: a plain multipart endpoint for attaching
     files to any InvoiceNinja entity that has a `/{id}/upload` route.
@@ -579,7 +1075,9 @@ def register_upload_client_tool(mcp: FastMCP, client: httpx.AsyncClient) -> None
 
 
 def build_server(
-    client: httpx.AsyncClient | None = None, spec: dict | None = None
+    client: httpx.AsyncClient | None = None,
+    spec: dict | None = None,
+    auth: InvoiceNinjaOAuthProvider | None = None,
 ) -> FastMCP:
     """Load the local OpenAPI spec and turn every documented InvoiceNinja
     endpoint into a FastMCP tool. The API token is supplied per request by the
@@ -588,7 +1086,7 @@ def build_server(
 
     `client` is injectable for testing; in production the default client
     targets INVOICENINJA_SERVER_URL and authenticates from the per-request
-    contextvar.
+    contextvar. `auth` enables OAuth; None keeps plain token pass-through.
     """
     if client is None:
         # No /api/v1 suffix here: unlike trillium-mcp's ETAPI spec (whose
@@ -618,6 +1116,7 @@ def build_server(
     mcp = FastMCP.from_openapi(
         openapi_spec=spec,
         client=client,
+        auth=auth,
         name="InvoiceNinja MCP",
         validate_output=False,
         route_maps=[
@@ -652,7 +1151,7 @@ def build_error_server(error: BaseException) -> FastMCP:
     instructions = (
         f"This InvoiceNinja MCP server FAILED TO START and exposes no "
         f"InvoiceNinja tools.\n\nReason: {summary}\n\nThe bundled OpenAPI spec "
-        f"could not be loaded. Call the `startup_error` tool for the full error."
+        f"could not be loaded, or the auth configuration is invalid. Call the `startup_error` tool for the full error."
     )
     mcp = FastMCP(
         name="InvoiceNinja MCP (startup failed)",
@@ -671,9 +1170,114 @@ def build_error_server(error: BaseException) -> FastMCP:
     return mcp
 
 
-def serve(mcp: FastMCP) -> None:
-    """Serve an MCP server over streamable HTTP behind the token-capture
-    middleware, using the MCP_* environment configuration."""
+class BearerPrefixMiddleware:
+    """`both` mode: turn a raw `Authorization: <api token>` header -- what
+    token-mode clients send -- into `Bearer <token>`, the only form FastMCP's
+    OAuth middleware reads. InvoiceNinjaOAuthProvider.verify_token then passes it
+    through to InvoiceNinja. Pure ASGI, like TokenCaptureMiddleware.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = []
+            for name, value in scope.get("headers") or []:
+                if name == b"authorization" and value and b" " not in value.strip():
+                    value = b"Bearer " + value.strip()
+                headers.append((name, value))
+            scope = {**scope, "headers": headers}
+        await self.app(scope, receive, send)
+
+
+class UploadAuthMiddleware:
+    """OAuth/both modes: FastMCP custom routes (/upload/...) sit outside its
+    OAuth middleware, so verify the Bearer here and expose the minted InvoiceNinja
+    token via the `_incoming_auth` contextvar. Other paths pass through.
+    """
+
+    def __init__(self, app, provider) -> None:
+        self.app = app
+        self.provider = provider
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/upload/"):
+            await self.app(scope, receive, send)
+            return
+        raw = dict(scope.get("headers") or []).get(b"authorization", b"").decode()
+        if raw[:7].lower() == "bearer ":
+            raw = raw[7:].strip()
+        found = await self.provider.verify_token(raw) if raw else None
+        if found is None:
+            await JSONResponse(
+                {"error": "invalid or missing bearer token"}, 401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )(scope, receive, send)
+            return
+        reset = _incoming_auth.set(found.claims["api_token"])
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _incoming_auth.reset(reset)
+
+
+ISS_METADATA_PREFIX = "/.well-known/oauth-authorization-server"
+
+
+class IssuerFlagMiddleware:
+    """Add `authorization_response_iss_parameter_supported: true` (RFC 9207) to
+    the authorization-server metadata. The MCP SDK builds that document without
+    the flag, but /login does send `iss` on the redirect, and the spec requires
+    advertising it when included. Buffers only that one small JSON response.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope.get("path", "").startswith(ISS_METADATA_PREFIX):
+            await self.app(scope, receive, send)
+            return
+        start, chunks = None, []
+
+        async def capture(message):
+            nonlocal start
+            if message["type"] == "http.response.start":
+                start = message
+            elif message["type"] == "http.response.body":
+                chunks.append(message.get("body", b""))
+                if message.get("more_body"):
+                    return
+                body = b"".join(chunks)
+                if start["status"] == 200:
+                    try:
+                        doc = json.loads(body)
+                        doc["authorization_response_iss_parameter_supported"] = True
+                        body = json.dumps(doc).encode()
+                    except ValueError:
+                        pass
+                headers = [(k, v) for k, v in start["headers"] if k.lower() != b"content-length"]
+                headers.append((b"content-length", str(len(body)).encode()))
+                await send({**start, "headers": headers})
+                await send({"type": "http.response.body", "body": body})
+
+        await self.app(scope, receive, capture)
+
+
+def wrap_app(inner, mode: str, auth=None):
+    """Put the auth-mode's ASGI gate in front of FastMCP's app."""
+    if mode == "token":
+        return TokenCaptureMiddleware(inner)
+    if mode == "both":
+        return IssuerFlagMiddleware(BearerPrefixMiddleware(UploadAuthMiddleware(inner, auth)))
+    return IssuerFlagMiddleware(UploadAuthMiddleware(inner, auth))
+
+
+def serve(mcp: FastMCP, mode: str = "token") -> None:
+    """Serve an MCP server over streamable HTTP, using the MCP_* environment
+    configuration. In `token` mode TokenCaptureMiddleware gates the endpoint;
+    otherwise FastMCP's OAuth middleware does (see InvoiceNinjaOAuthProvider)."""
     host = os.environ.get(MCP_HOST_ENV, DEFAULT_HOST)
     port = int(os.environ.get(MCP_PORT_ENV, DEFAULT_PORT))
     path = os.environ.get(MCP_PATH_ENV, DEFAULT_PATH)
@@ -688,23 +1292,28 @@ def serve(mcp: FastMCP) -> None:
         inner = mcp.http_app(path=path, host_origin_protection=False)
         print(f"Host protection OFF (any Host accepted) -- set "
               f"{MCP_ALLOWED_HOSTS_ENV} to restrict.", file=sys.stderr)
-    app = TokenCaptureMiddleware(inner)
+    app = wrap_app(inner, mode, mcp.auth)
 
     print(f"Serving InvoiceNinja MCP on http://{host}:{port}{path} "
-          f"(client supplies the API token via the Authorization header)",
+          + (f"(client supplies the API token via the Authorization header)"
+          if mode == "token" else f"(auth mode: {mode})"),
           file=sys.stderr)
     uvicorn.run(app, host=host, port=port)
 
 
 def main():
+    mode = "token"
     try:
+        mode = resolve_auth_mode()
+        auth = None if mode == "token" else build_oauth_provider(mode)
         server_url = os.environ.get(SERVER_ENV, DEFAULT_SERVER_URL).rstrip("/")
-        mcp = build_server(spec=resolve_spec(server_url))
+        mcp = build_server(spec=resolve_spec(server_url), auth=auth)
     except Exception as e:
         print(f"Error: failed to build InvoiceNinja MCP server: {e}",
               file=sys.stderr)
+        mode = "token"
         mcp = build_error_server(e)
-    serve(mcp)
+    serve(mcp, mode)
 
 
 if __name__ == "__main__":
