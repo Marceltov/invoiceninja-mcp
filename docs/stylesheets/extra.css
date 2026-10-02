@@ -1,18 +1,19 @@
-/* InvoiceNinja brand: green on near-black */
+/* InvoiceNinja brand: blue accent on near-black, like the app sidebar and site hero */
 :root,
 [data-md-color-scheme="default"] {
-  --md-primary-fg-color: #1f2124;
+  --md-primary-fg-color: #1e2024;
   --md-primary-fg-color--light: #33373d;
   --md-primary-fg-color--dark: #0c0d0e;
-  --md-accent-fg-color: #00bc7d;
-  --md-typeset-a-color: #009c68;
+  --md-accent-fg-color: #2563eb;
+  --md-typeset-a-color: #2563eb;
 }
 
 [data-md-color-scheme="slate"] {
-  --md-primary-fg-color: #1f2124;
-  --md-primary-fg-color--light: #33373d;
-  --md-primary-fg-color--dark: #0c0d0e;
-  --md-accent-fg-color: #00d492;
-  --md-typeset-a-color: #00d492;
-  --md-default-bg-color: #17181a;
+  --md-primary-fg-color: #0c0d0e;
+  --md-primary-fg-color--light: #1e2024;
+  --md-primary-fg-color--dark: #000;
+  --md-accent-fg-color: #4b8cf5;
+  --md-typeset-a-color: #4b8cf5;
+  --md-default-bg-color: #0c0d0e;
+  --md-default-bg-color--light: #1e2024;
 }
