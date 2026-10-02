@@ -15,6 +15,9 @@ from tests.live._client import MCP_URL
 EMAIL = "admin@example.com"
 PASSWORD = "invoiceninja-mcp-dev"  # committed dev fixture credential (see CLAUDE.md)
 REDIRECT = "http://localhost:9/cb"
+INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2025-03-26", "capabilities": {},
+    "clientInfo": {"name": "t", "version": "0"}}}
 ORIGIN = httpx.URL(MCP_URL).copy_with(path="/", query=None)
 
 
@@ -34,6 +37,7 @@ def test_oauth_login_tool_call_and_revoke():
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
             })
+            assert reg.status_code in (200, 201), reg.text
             client_id = reg.json()["client_id"]
             verifier = secrets.token_urlsafe(48)
             challenge = base64.urlsafe_b64encode(
@@ -54,25 +58,28 @@ def test_oauth_login_tool_call_and_revoke():
                 "redirect_uri": REDIRECT, "client_id": client_id,
                 "code_verifier": verifier,
             })
+            assert r.status_code == 200, r.text
             access = r.json()["access_token"]
+            raw_headers = {"Authorization": f"Bearer {access}",
+                           "Accept": "application/json, text/event-stream"}
 
             transport = StreamableHttpTransport(
                 url=MCP_URL, headers={"Authorization": f"Bearer {access}"})
             async with Client(transport) as c:
                 assert await c.call_tool("getClients", {}) is not None
 
+            # Same raw request before and after revoke: 401 afterwards must mean
+            # "token rejected", not "malformed request" or an outage.
+            r = await http.post(MCP_URL, headers=raw_headers, json=INIT)
+            assert r.status_code != 401, r.text
+            assert r.status_code == 200, r.text
+
             r = await http.post(str(ORIGIN.copy_with(path="/revoke")), data={
                 "token": access, "client_id": client_id,
                 "client_secret": ""})  # the SDK's /revoke requires the field even for public clients
             assert r.status_code == 200
 
-            transport = StreamableHttpTransport(
-                url=MCP_URL, headers={"Authorization": f"Bearer {access}"})
-            try:
-                async with Client(transport) as c:
-                    await c.call_tool("getClients", {})
-            except Exception:
-                return  # 401 from the revoked bearer
-            raise AssertionError("revoked token still works")
+            r = await http.post(MCP_URL, headers=raw_headers, json=INIT)
+            assert r.status_code == 401, f"revoked token: {r.status_code} {r.text}"
 
     asyncio.run(run())
