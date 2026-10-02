@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import traceback
@@ -29,6 +30,8 @@ import httpx
 import uvicorn
 import yaml
 from fastmcp import FastMCP
+from fastmcp.server.auth import AccessToken, OAuthProvider
+from fastmcp.server.auth.auth import ClientRegistrationOptions, RevocationOptions
 from fastmcp.server.providers.openapi import MCPType, RouteMap
 from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import File
@@ -39,7 +42,15 @@ from key_value.aio.stores.filetree import (
     FileTreeV1KeySanitizationStrategy,
 )
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+from mcp.server.auth.provider import (
+    AuthorizationCode,
+    AuthorizationParams,
+    RefreshToken,
+    TokenError,
+    construct_redirect_uri,
+)
 from mcp.server.auth.routes import validate_issuer_url
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mcp.types import TextContent
 from pydantic import AnyHttpUrl
 from starlette.requests import Request
@@ -158,6 +169,213 @@ class TokenCaptureMiddleware:
             await self.app(scope, receive, send)
         finally:
             _incoming_auth.reset(token)
+
+
+class InvoiceNinjaOAuthProvider(OAuthProvider):
+    """OAuth 2.1 authorization server whose login is the InvoiceNinja password.
+
+    FastMCP/the MCP SDK serve discovery, dynamic client registration,
+    /authorize, /token (PKCE) and /revoke on top of these methods. Logging in
+    (see _login, added alongside) mints a per-client InvoiceNinja API token;
+    every code and token we issue maps to it, and verify_token hands it to
+    InvoiceNinjaTokenAuth through the access token's `api_token` claim.
+
+    `passthrough` is `both` mode: a bearer that isn't one of ours is forwarded
+    to InvoiceNinja as a raw API token, exactly as in `token` mode.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        store: AsyncKeyValue,
+        api: httpx.AsyncClient,
+        passthrough: bool,
+        mcp_path: str = DEFAULT_PATH,
+    ):
+        super().__init__(
+            base_url=base_url,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+            revocation_options=RevocationOptions(enabled=True),
+        )
+        self.store = store
+        self.api = api  # unauthenticated: only /api/v1/login and /api/v1/tokens
+        self.passthrough = passthrough
+        self.mcp_path = mcp_path
+
+    def _resource_ok(self, resource: str | None) -> bool:
+        """RFC 8707 audience check: a token bound to some other server is not ours.
+        Clients that sent no `resource` are accepted."""
+        if not resource:
+            return True
+        base = str(self.base_url).rstrip("/")
+        return resource.rstrip("/") in {base, base + self.mcp_path.rstrip("/")}
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        data = await self.store.get(client_id, collection="clients")
+        return OAuthClientInformationFull.model_validate(data) if data else None
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        await self.store.put(
+            client_info.client_id,
+            client_info.model_dump(mode="json"),
+            collection="clients",
+        )
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        pending_id = secrets.token_urlsafe(32)
+        await self.store.put(
+            pending_id,
+            {"client_id": client.client_id, "params": params.model_dump(mode="json")},
+            collection="pending",
+            ttl=PENDING_LOGIN_TTL,
+        )
+        return f"{str(self.base_url).rstrip('/')}/login?id={pending_id}"
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        data = await self.store.get(authorization_code, collection="codes")
+        if not data or data["code"]["client_id"] != client.client_id:
+            return None
+        return AuthorizationCode.model_validate(data["code"])
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        data = await self.store.get(authorization_code.code, collection="codes")
+        if not data:
+            raise TokenError("invalid_grant", "Authorization code not found or already used.")
+        await self.store.delete(authorization_code.code, collection="codes")
+        return await self._issue(
+            client.client_id,
+            authorization_code.scopes,
+            data["api_token"],
+            data["token_id"],
+            authorization_code.resource,
+        )
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        data = await self.store.get(refresh_token, collection="refresh")
+        if not data or data["client_id"] != client.client_id:
+            return None
+        return RefreshToken(
+            token=refresh_token,
+            client_id=data["client_id"],
+            scopes=data["scopes"],
+            expires_at=data["expires_at"],
+        )
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        data = await self.store.get(refresh_token.token, collection="refresh")
+        if not data:
+            raise TokenError("invalid_grant", "Refresh token not found or already used.")
+        if not set(scopes) <= set(refresh_token.scopes):
+            raise TokenError("invalid_scope", "Requested scopes exceed the original grant.")
+        # Rotate: the old pair dies, the minted API token lives on in the new one.
+        await self._drop(data["access"], refresh_token.token)
+        return await self._issue(
+            client.client_id,
+            scopes or refresh_token.scopes,
+            data["api_token"],
+            data["token_id"],
+            data.get("resource"),
+        )
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        data = await self.store.get(token, collection="access")
+        if not data or not self._resource_ok(data.get("resource")):
+            return None
+        return AccessToken(
+            token=token,
+            client_id=data["client_id"],
+            scopes=data["scopes"],
+            expires_at=data["expires_at"],
+            claims={"api_token": data["api_token"]},
+        )
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        found = await self.load_access_token(token)
+        if found or not self.passthrough or token.startswith(OAUTH_TOKEN_PREFIX):
+            return found
+        # `both` mode: not ours, so it's a raw API token; InvoiceNinja judges it.
+        return AccessToken(
+            token=token, client_id="api-token", scopes=[],
+            claims={"api_token": token},
+        )
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        if isinstance(token, RefreshToken):
+            data = await self.store.get(token.token, collection="refresh")
+            pair = (data["access"], token.token) if data else None
+        else:
+            data = await self.store.get(token.token, collection="access")
+            pair = (token.token, data["refresh"]) if data else None
+        if not pair:
+            return
+        await self._drop(*pair)
+        # Also delete the minted token in InvoiceNinja. Best effort: the OAuth
+        # pair is already gone, so a failure only leaves a stray, named token.
+        # Never /logout: that would kill the user's shared session token.
+        if data.get("token_id"):
+            try:
+                await self.api.delete(
+                    f"/api/v1/tokens/{data['token_id']}",
+                    headers={"X-API-TOKEN": data["api_token"]},
+                )
+            except httpx.HTTPError:
+                pass
+
+    async def _issue(
+        self,
+        client_id: str,
+        scopes: list[str],
+        api_token: str,
+        token_id: str | None,
+        resource: str | None,
+    ) -> OAuthToken:
+        access = OAUTH_TOKEN_PREFIX + secrets.token_urlsafe(32)
+        refresh = OAUTH_TOKEN_PREFIX + secrets.token_urlsafe(32)
+        now = int(time.time())
+        common = {
+            "client_id": client_id, "scopes": scopes, "api_token": api_token,
+            "token_id": token_id, "resource": resource,
+        }
+        await self.store.put(
+            access,
+            {**common, "refresh": refresh, "expires_at": now + ACCESS_TOKEN_TTL},
+            collection="access",
+            ttl=ACCESS_TOKEN_TTL,
+        )
+        # ponytail: a client that never comes back leaves its minted token in
+        # InvoiceNinja after this TTL; delete it there by hand (Settings -> API
+        # tokens), or add a sweeper over expired refresh entries if that grows.
+        await self.store.put(
+            refresh,
+            {**common, "access": access, "expires_at": now + REFRESH_TOKEN_TTL},
+            collection="refresh",
+            ttl=REFRESH_TOKEN_TTL,
+        )
+        return OAuthToken(
+            access_token=access,
+            token_type="Bearer",
+            expires_in=ACCESS_TOKEN_TTL,
+            refresh_token=refresh,
+            scope=" ".join(scopes) or None,
+        )
+
+    async def _drop(self, access: str, refresh: str) -> None:
+        await self.store.delete(access, collection="access")
+        await self.store.delete(refresh, collection="refresh")
 
 
 # The InvoiceNinja OpenAPI spec ships alongside this server (baked into the
@@ -507,6 +725,21 @@ def build_oauth_store() -> AsyncKeyValue:
         salt="invoiceninja-mcp-oauth",
         # A changed secret turns stored state into misses: clients just log in again.
         raise_on_decryption_error=False,
+    )
+
+
+def build_oauth_provider(mode: str) -> InvoiceNinjaOAuthProvider:
+    server_url = os.environ.get(SERVER_ENV, DEFAULT_SERVER_URL).rstrip("/")
+    return InvoiceNinjaOAuthProvider(
+        base_url=validate_base_url(),
+        store=build_oauth_store(),
+        api=httpx.AsyncClient(
+            base_url=server_url,
+            headers={"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"},
+            timeout=60,
+        ),
+        passthrough=mode == "both",
+        mcp_path=os.environ.get(MCP_PATH_ENV, DEFAULT_PATH),
     )
 
 
