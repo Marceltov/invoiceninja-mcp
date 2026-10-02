@@ -391,7 +391,7 @@ def make_app(passthrough, seen):
     )
     inner = mcp.http_app(path=server.DEFAULT_PATH)
     mode = "both" if passthrough else "oauth"
-    return inner, server.wrap_app(inner, mode)
+    return inner, server.wrap_app(inner, mode, provider)
 
 
 def factory_for(app):
@@ -519,3 +519,21 @@ def test_metadata_advertises_iss_parameter_support():
     assert meta["authorization_response_iss_parameter_supported"] is True
     assert meta["issuer"].rstrip("/") == "http://localhost"
     assert "registration_endpoint" in meta  # untouched fields survive the rewrite
+
+
+def test_both_mode_raw_header_upload_reaches_upstream():
+    seen = {}
+    inner, app = make_app(True, seen)
+
+    async def run():
+        async with inner.router.lifespan_context(inner):
+            async with factory_for(app)() as http:
+                r = await http.post(
+                    "/upload/clients/abc",
+                    files={"documents": ("a.txt", b"hi", "text/plain")},
+                    headers={"Authorization": "raw-api-token"},
+                )
+                return r.status_code
+
+    assert asyncio.run(run()) == 200
+    assert seen["upload_token"] == "raw-api-token"

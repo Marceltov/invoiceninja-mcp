@@ -1186,6 +1186,37 @@ class BearerPrefixMiddleware:
         await self.app(scope, receive, send)
 
 
+class UploadAuthMiddleware:
+    """OAuth/both modes: FastMCP custom routes (/upload/...) sit outside its
+    OAuth middleware, so verify the Bearer here and expose the minted InvoiceNinja
+    token via the `_incoming_auth` contextvar. Other paths pass through.
+    """
+
+    def __init__(self, app, provider) -> None:
+        self.app = app
+        self.provider = provider
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/upload/"):
+            await self.app(scope, receive, send)
+            return
+        raw = dict(scope.get("headers") or []).get(b"authorization", b"").decode()
+        if raw[:7].lower() == "bearer ":
+            raw = raw[7:].strip()
+        found = await self.provider.verify_token(raw) if raw else None
+        if found is None:
+            await JSONResponse(
+                {"error": "invalid or missing bearer token"}, 401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )(scope, receive, send)
+            return
+        reset = _incoming_auth.set(found.claims["api_token"])
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _incoming_auth.reset(reset)
+
+
 ISS_METADATA_PREFIX = "/.well-known/oauth-authorization-server"
 
 
@@ -1229,13 +1260,13 @@ class IssuerFlagMiddleware:
         await self.app(scope, receive, capture)
 
 
-def wrap_app(inner, mode: str):
+def wrap_app(inner, mode: str, auth=None):
     """Put the auth-mode's ASGI gate in front of FastMCP's app."""
     if mode == "token":
         return TokenCaptureMiddleware(inner)
     if mode == "both":
-        return IssuerFlagMiddleware(BearerPrefixMiddleware(inner))
-    return IssuerFlagMiddleware(inner)
+        return IssuerFlagMiddleware(BearerPrefixMiddleware(UploadAuthMiddleware(inner, auth)))
+    return IssuerFlagMiddleware(UploadAuthMiddleware(inner, auth))
 
 
 def serve(mcp: FastMCP, mode: str = "token") -> None:
@@ -1256,7 +1287,7 @@ def serve(mcp: FastMCP, mode: str = "token") -> None:
         inner = mcp.http_app(path=path, host_origin_protection=False)
         print(f"Host protection OFF (any Host accepted) -- set "
               f"{MCP_ALLOWED_HOSTS_ENV} to restrict.", file=sys.stderr)
-    app = wrap_app(inner, mode)
+    app = wrap_app(inner, mode, mcp.auth)
 
     print(f"Serving InvoiceNinja MCP on http://{host}:{port}{path} "
           + (f"(client supplies the API token via the Authorization header)"
