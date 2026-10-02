@@ -16,6 +16,7 @@
 # with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import base64
+import html
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import time
 import traceback
 from contextvars import ContextVar
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -54,7 +56,8 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mcp.types import TextContent
 from pydantic import AnyHttpUrl
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from starlette.routing import Route
 
 # All configuration comes from the environment so the server runs cleanly as a
 # container sidecar with no command-line arguments.
@@ -169,6 +172,66 @@ class TokenCaptureMiddleware:
             await self.app(scope, receive, send)
         finally:
             _incoming_auth.reset(token)
+
+
+def _page(inner: str, status: int = 200) -> HTMLResponse:
+    """Minimal standalone HTML page for the login flow."""
+    body = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>InvoiceNinja MCP login</title><style>body{font-family:system-ui,"
+        "sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.5}"
+        "input,button{font:inherit;padding:.4rem;margin:.3rem 0;width:100%;"
+        f"box-sizing:border-box}}</style></head><body><h1>InvoiceNinja MCP</h1>{inner}"
+        "</body></html>"
+    )
+    # DENY framing so the password form can't be clickjacked.
+    return HTMLResponse(body, status_code=status, headers={"X-Frame-Options": "DENY"})
+
+
+def _login_page(pending_id, client_name, redirect_host, error="", status=200):
+    """The one page a human sees: who is asking, where the code goes, credentials."""
+    e = html.escape
+    err = f'<p style="color:#b00">{e(error)}</p>' if error else ""
+    return _page(
+        f"{err}<p><b>{e(client_name)}</b> wants access to your InvoiceNinja account. "
+        f"After login you will be sent to <b>{e(redirect_host)}</b>. Only continue "
+        f"if you started this.</p>"
+        f'<form method="post"><input type="hidden" name="id" value="{e(pending_id)}">'
+        f'<label>Email <input type="email" name="email" autofocus required></label>'
+        f'<label>Password <input type="password" name="password" required></label>'
+        f'<label>2FA code (only if enabled) <input name="one_time_password" '
+        f'autocomplete="one-time-code" inputmode="numeric"></label>'
+        f"<button>Authorize</button></form>",
+        status,
+    )
+
+
+def _dead_end_page(heading: str, what: str, status: int) -> HTMLResponse:
+    """A login that can't continue from here. The usual cause is the MCP app
+    interrupting its own OAuth flow -- claude.ai asking the user to log in to
+    claude.ai partway through, then dropping the finished login -- so say that,
+    say it isn't the server's fault, and give the fix."""
+    return _page(
+        f"<h2>{html.escape(heading)}</h2><p>{html.escape(what)}</p>"
+        "<p><b>Why:</b> your app interrupted its own login. Most often it asked "
+        "you to log in to the app itself (for example claude.ai) partway through, "
+        "then lost track of this login. Nothing is wrong with your InvoiceNinja or "
+        "this MCP server.</p>"
+        "<p><b>Fix:</b> go back to your app and remove this connector and add it "
+        "again, or use its Reconnect / Authenticate button. Being logged in to "
+        "the app first avoids the interruption.</p>",
+        status,
+    )
+
+
+def _invoiceninja_error(response: httpx.Response) -> str:
+    """A human sentence for a failed InvoiceNinja call."""
+    try:
+        message = response.json().get("message")
+    except (ValueError, AttributeError):
+        message = None
+    return message or f"InvoiceNinja rejected the request (HTTP {response.status_code})."
 
 
 class InvoiceNinjaOAuthProvider(OAuthProvider):
@@ -376,6 +439,112 @@ class InvoiceNinjaOAuthProvider(OAuthProvider):
     async def _drop(self, access: str, refresh: str) -> None:
         await self.store.delete(access, collection="access")
         await self.store.delete(refresh, collection="refresh")
+
+    def get_routes(self, mcp_path: str | None = None) -> list[Route]:
+        return [
+            *super().get_routes(mcp_path),
+            Route("/login", self._login, methods=["GET", "POST"]),
+        ]
+
+    async def _login(self, request: Request):
+        form = await request.form() if request.method == "POST" else request.query_params
+        pending_id = form.get("id", "")
+        pending = (
+            await self.store.get(pending_id, collection="pending") if pending_id else None
+        )
+        if not pending:
+            return _dead_end_page(
+                "Login link expired or already used",
+                "Login links work once, for 10 minutes.",
+                400,
+            )
+        if pending.get("done"):
+            # A browser re-submitted a login that already succeeded (seen with
+            # claude.ai's connector flow). Mint nothing; say what happened.
+            return _dead_end_page(
+                "Login already completed",
+                "Your login was accepted and finished a moment ago; the browser "
+                "sent the form a second time. If your app now shows the connector "
+                "without tools, it dropped that finished login.",
+                200,
+            )
+        params = AuthorizationParams.model_validate(pending["params"])
+        client = await self.get_client(pending["client_id"])
+        client_name = (client.client_name if client else None) or pending["client_id"]
+        redirect = str(params.redirect_uri)
+        page = (pending_id, client_name, urlsplit(redirect).netloc or redirect)
+        if request.method == "GET":
+            return _login_page(*page)
+
+        def failed(message: str):
+            return _login_page(*page, error=message, status=401)
+
+        # The password goes straight to InvoiceNinja and is never stored or logged.
+        credentials = {"email": form.get("email", ""), "password": form.get("password", "")}
+        if form.get("one_time_password"):
+            credentials["one_time_password"] = form["one_time_password"]
+        try:
+            login = await self.api.post("/api/v1/login", json=credentials)
+        except httpx.HTTPError as e:
+            return failed(f"Could not reach InvoiceNinja: {e.__class__.__name__}.")
+        if not login.is_success:
+            return failed(_invoiceninja_error(login))
+        try:
+            data = login.json()["data"]
+            entry = data[0] if isinstance(data, list) else data
+            session_token = entry["token"]["token"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            return failed("InvoiceNinja returned no company to log in to.")
+
+        # Mint a dedicated, named token so each client is visible and revocable in
+        # InvoiceNinja. The session token is dropped WITHOUT /logout: it is the
+        # user's shared "User Token" and logging out would invalidate it.
+        name = f"MCP: {client_name}"[:100]
+        try:
+            minted = await self.api.post(
+                "/api/v1/tokens", json={"name": name},
+                headers={"X-API-TOKEN": session_token},
+            )
+        except httpx.HTTPError as e:
+            return failed(f"Could not reach InvoiceNinja: {e.__class__.__name__}.")
+        if not minted.is_success:
+            return failed(_invoiceninja_error(minted))
+        try:
+            token = minted.json()["data"]
+            api_token, token_id = token["token"], token["id"]
+        except (ValueError, KeyError, TypeError):
+            return failed("InvoiceNinja did not return the new API token.")
+
+        # Keep a short-lived marker instead of deleting, so a replayed form gets
+        # an honest answer (see above) rather than "expired".
+        await self.store.put(
+            pending_id, {"done": True}, collection="pending", ttl=PENDING_LOGIN_TTL
+        )
+        code = AuthorizationCode(
+            code=OAUTH_TOKEN_PREFIX + secrets.token_urlsafe(32),
+            client_id=pending["client_id"],
+            scopes=params.scopes or [],
+            expires_at=time.time() + AUTH_CODE_TTL,
+            code_challenge=params.code_challenge,
+            redirect_uri=params.redirect_uri,
+            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+            resource=params.resource,
+        )
+        await self.store.put(
+            code.code,
+            {"code": code.model_dump(mode="json"), "api_token": api_token,
+             "token_id": token_id},
+            collection="codes",
+            ttl=AUTH_CODE_TTL,
+        )
+        # RFC 9207: tell the client which authorization server answered.
+        return RedirectResponse(
+            construct_redirect_uri(
+                redirect, code=code.code, state=params.state,
+                iss=str(self.base_url).rstrip("/"),
+            ),
+            status_code=302,
+        )
 
 
 # The InvoiceNinja OpenAPI spec ships alongside this server (baked into the

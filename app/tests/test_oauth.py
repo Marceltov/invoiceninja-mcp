@@ -219,3 +219,134 @@ def test_build_oauth_provider(monkeypatch, tmp_path):
     p = server.build_oauth_provider("both")
     assert p.passthrough is True
     assert str(p.base_url).rstrip("/") == "https://mcp.example"
+
+
+from mcp.server.auth.provider import AuthorizationParams
+from starlette.applications import Starlette
+from starlette.testclient import TestClient
+
+
+def begin_login(p, client_name="itest"):
+    """Register CLIENT and start an authorize -> returns the pending login id."""
+    client = CLIENT.model_copy(update={"client_name": client_name})
+
+    async def go():
+        await p.register_client(client)
+        url = await p.authorize(client, AuthorizationParams(
+            state="s1", scopes=[], code_challenge="x" * 43,
+            redirect_uri="http://localhost:9/cb", redirect_uri_provided_explicitly=True,
+        ))
+        return httpx.URL(url).params["id"]
+
+    return asyncio.run(go())
+
+
+def login_client(p):
+    return TestClient(Starlette(routes=p.get_routes(server.DEFAULT_PATH)),
+                      follow_redirects=False)
+
+
+def test_login_page_shows_client_and_redirect_host_escaped():
+    p, _ = make_provider()
+    pid = begin_login(p, client_name="<b>evil</b>")
+    page = login_client(p).get("/login", params={"id": pid})
+    assert page.status_code == 200
+    assert "&lt;b&gt;evil&lt;/b&gt;" in page.text and "<b>evil</b>" not in page.text
+    assert "localhost:9" in page.text
+    assert 'name="email"' in page.text and 'name="one_time_password"' in page.text
+
+
+def test_login_mints_named_token_and_redirects_with_code_state_and_iss():
+    p, calls = make_provider()
+    pid = begin_login(p)
+    r = login_client(p).post("/login", data={"id": pid, "email": "a@b.c", "password": "pw"})
+    assert r.status_code == 302
+    back = httpx.URL(r.headers["location"])
+    assert back.params["state"] == "s1"
+    assert back.params["iss"] == "http://localhost"
+    assert back.params["code"].startswith(server.OAUTH_TOKEN_PREFIX)
+    mint = [c for c in calls if c.url.path == "/api/v1/tokens"][0]
+    assert mint.headers["X-API-TOKEN"] == "session-tok"
+    assert json.loads(mint.content)["name"] == "MCP: itest"
+    assert not any(c.url.path.endswith("/logout") for c in calls)
+
+
+def test_token_name_is_truncated_for_long_client_names():
+    p, calls = make_provider()
+    pid = begin_login(p, client_name="x" * 500)
+    login_client(p).post("/login", data={"id": pid, "email": "a@b.c", "password": "pw"})
+    mint = [c for c in calls if c.url.path == "/api/v1/tokens"][0]
+    assert len(json.loads(mint.content)["name"]) <= 100
+
+
+def test_wrong_password_rerenders_and_pending_login_survives():
+    p, calls = make_provider()
+    pid = begin_login(p)
+    c = login_client(p)
+    bad = c.post("/login", data={"id": pid, "email": "a@b.c", "password": "nope"})
+    assert bad.status_code == 401
+    assert "do not match our records" in bad.text
+    assert not any(x.url.path == "/api/v1/tokens" for x in calls)
+    ok = c.post("/login", data={"id": pid, "email": "a@b.c", "password": "pw"})
+    assert ok.status_code == 302
+
+
+def test_one_time_password_is_forwarded_only_when_given():
+    p, calls = make_provider()
+    pid = begin_login(p)
+    login_client(p).post("/login", data={
+        "id": pid, "email": "a@b.c", "password": "pw", "one_time_password": "123456"})
+    body = json.loads([c for c in calls if c.url.path == "/api/v1/login"][0].content)
+    assert body["one_time_password"] == "123456"
+
+    p2, calls2 = make_provider()
+    pid2 = begin_login(p2)
+    login_client(p2).post("/login", data={"id": pid2, "email": "a@b.c", "password": "pw"})
+    body2 = json.loads([c for c in calls2 if c.url.path == "/api/v1/login"][0].content)
+    assert "one_time_password" not in body2
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, json={"data": []}),                 # user in no company
+        httpx.Response(502, text="<html>bad gateway</html>"),   # not JSON
+        httpx.Response(200, text="not json"),
+    ],
+)
+def test_unexpected_login_answers_show_an_error_not_a_500(response):
+    p, _ = make_provider(handler=lambda request: response)
+    pid = begin_login(p)
+    r = login_client(p).post("/login", data={"id": pid, "email": "a@b.c", "password": "pw"})
+    assert r.status_code == 401
+    assert "InvoiceNinja" in r.text
+
+
+def test_minting_failure_shows_an_error_and_issues_no_code():
+    def handler(request):
+        if request.url.path == "/api/v1/login":
+            return httpx.Response(200, json={"data": [{"token": {"token": "session-tok"}}]})
+        return httpx.Response(403, json={"message": "Forbidden"})
+
+    p, _ = make_provider(handler=handler)
+    pid = begin_login(p)
+    r = login_client(p).post("/login", data={"id": pid, "email": "a@b.c", "password": "pw"})
+    assert r.status_code == 401 and "Forbidden" in r.text
+
+
+def test_expired_login_link_is_rejected():
+    p, _ = make_provider()
+    r = login_client(p).get("/login", params={"id": "nope"})
+    assert r.status_code == 400
+    assert "expired" in r.text.lower()
+
+
+def test_replayed_login_says_completed_and_mints_nothing():
+    p, calls = make_provider()
+    pid = begin_login(p)
+    c = login_client(p)
+    assert c.post("/login", data={"id": pid, "email": "a@b.c", "password": "pw"}).status_code == 302
+    mints_before = len([x for x in calls if x.url.path == "/api/v1/tokens"])
+    again = c.post("/login", data={"id": pid, "email": "a@b.c", "password": "pw"})
+    assert again.status_code == 200 and "already" in again.text.lower()
+    assert len([x for x in calls if x.url.path == "/api/v1/tokens"]) == mints_before
