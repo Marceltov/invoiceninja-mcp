@@ -101,6 +101,10 @@ services:
     restart: unless-stopped
     environment:
       INVOICENINJA_SERVER_URL: http://invoiceninja:80
+      MCP_BASE_URL: http://localhost:8081
+      MCP_OAUTH_SECRET: dev-only-oauth-secret
+    volumes:
+      - mcp-oauth:/data
     ports:
       - "8081:8081"
     depends_on:
@@ -112,3 +116,4 @@ volumes:
   app_storage:
   mysql_data:
   redis_data:
+  mcp-oauth:
