@@ -40,6 +40,6 @@ After login the server mints an API token named `MCP: <client name>` for that cl
 
 ## Revoking access
 
-Remove the connector in the client, which revokes its token. You can also delete the `MCP: <client name>` token in InvoiceNinja. Either way the token stops working at once.
+Removing the connector in the client revokes its token: the server asks InvoiceNinja to delete the minted `MCP: <client name>` token, which InvoiceNinja archives, and archived tokens are rejected. You can also archive or delete that token in InvoiceNinja yourself, after which InvoiceNinja rejects the client's next call and the error shows up as a tool error.
 
 InvoiceNinja only archives a deleted token. Archived tokens are rejected, but the archived `MCP: <client name>` entries stay in the list.

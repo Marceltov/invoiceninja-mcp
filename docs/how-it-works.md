@@ -58,4 +58,4 @@ sequenceDiagram
 3. The redirect carries the authorization code and `iss`. The client exchanges the code (PKCE) for an `inmcp_` access token and a refresh token.
 4. On a tool call the server maps the access token to the minted InvoiceNinja token and sends it as `X-API-TOKEN`.
 
-`resolve_auth_mode()` picks `token`, `oauth` or `both` from the environment, and `wrap_app()` assembles the ASGI stack for it. In `both`, a small middleware adds `Bearer ` to raw tokens so FastMCP can parse them, and `IssuerFlagMiddleware` advertises `iss` support in the metadata. `UploadAuthMiddleware` gates the plain-HTTP `/upload/{entity}/{id}` route with the same bearer.
+`resolve_auth_mode()` picks `token`, `oauth` or `both` from the environment, and `wrap_app()` assembles the ASGI stack for it. In both `oauth` and `both`, `IssuerFlagMiddleware` advertises `iss` support in the metadata and `UploadAuthMiddleware` gates the plain-HTTP `/upload/{entity}/{id}` route with the same bearer. Only in `both` does `BearerPrefixMiddleware` add `Bearer ` to raw tokens so FastMCP can parse them.

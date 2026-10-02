@@ -56,14 +56,14 @@ Two kinds of tests, both under `app/tests/`:
 
 ### Token pass-through (the auth model)
 
-The server holds no secret. The API token travels per-request through a contextvar:
+In token mode the server holds no secret. The API token travels per-request through a contextvar:
 
 1. `TokenCaptureMiddleware` (pure-ASGI) requires an `Authorization` header on the MCP path, rejecting requests without one as `401` before FastMCP sees them. `/health` is always allowed through unauthenticated.
 2. `InvoiceNinjaTokenAuth` (an `httpx.Auth`) reads the contextvar on the outgoing InvoiceNinja call, strips a leading `Bearer ` if present, and sets it as `X-API-TOKEN`. It also sets a fixed `X-Requested-With: XMLHttpRequest` header, which InvoiceNinja's API docs describe as required.
 
 ### OAuth
 
-`InvoiceNinjaOAuthProvider` (subclass of the MCP SDK `OAuthProvider`) serves discovery, DCR, `/authorize`, `/token` (PKCE), `/revoke`, plus its own `/login` form. `/login` posts email, password and optional 2FA code to InvoiceNinja `/api/v1/login`, then mints a token named `MCP: <client>` via `/api/v1/tokens` with the session token. It **never** calls `/logout` (that deletes the user's shared "User Token"). Registrations and tokens live in a Fernet-encrypted store at `/data/oauth` keyed by `MCP_OAUTH_SECRET`; OAuth bearers carry the `inmcp_` prefix. `resolve_auth_mode()` picks `token|oauth|both` (unset means `both` when `MCP_BASE_URL` and `MCP_OAUTH_SECRET` are set, else `token`) and `wrap_app()` builds the ASGI stack: in `both`, `BearerPrefixMiddleware` lets raw tokens through, `UploadAuthMiddleware` gates `/upload/{entity}/{id}`, and `IssuerFlagMiddleware` advertises `iss`. Revoke drops the OAuth pair and best-effort `DELETE /api/v1/tokens/{id}`, which only archives the token. Tests: `app/tests/test_oauth.py` and `app/tests/live/test_oauth_flow.py`. 2FA and passkey/SSO logins are untested; CIMD is unsupported (DCR only). See ADR 0003.
+`InvoiceNinjaOAuthProvider` (subclass of the MCP SDK `OAuthProvider`) serves discovery, DCR, `/authorize`, `/token` (PKCE), `/revoke`, plus its own `/login` form. `/login` posts email, password and optional 2FA code to InvoiceNinja `/api/v1/login`, then mints a token named `MCP: <client>` via `/api/v1/tokens` with the session token. It **never** calls `/logout` (that deletes the user's shared "User Token"). Registrations and tokens live in a Fernet-encrypted store at `/data/oauth` keyed by `MCP_OAUTH_SECRET`; OAuth bearers carry the `inmcp_` prefix. `resolve_auth_mode()` picks `token|oauth|both` (unset means `both` when `MCP_BASE_URL` and `MCP_OAUTH_SECRET` are set, else `token`) and `wrap_app()` builds the ASGI stack: in both `oauth` and `both`, `UploadAuthMiddleware` gates `/upload/{entity}/{id}` and `IssuerFlagMiddleware` advertises `iss`; only `both` adds `BearerPrefixMiddleware`, which lets raw tokens through. Revoke drops the OAuth pair and best-effort `DELETE /api/v1/tokens/{id}`, which only archives the token. Tests: `app/tests/test_oauth.py` and `app/tests/live/test_oauth_flow.py`. 2FA and passkey/SSO logins are untested; CIMD is unsupported (DCR only). See ADR 0003.
 
 ### Startup resilience
 
