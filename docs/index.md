@@ -10,8 +10,13 @@ It runs as a **container sidecar** next to your InvoiceNinja instance and serves
 - :material-key: **[Stateless auth](security.md)** — no secret stored; each client sends its own API token.
 - :material-tools: **[Tools](tools.md)** — generated tools, plus `apiRequest` and `uploadClient`.
 - :material-cog: **[Configuration](configuration.md)** — environment variables and spec selection.
+- :material-puzzle: **[Claude Code plugin](https://invoiceninja-plugin.marceltov.de/)** — ready-made skills for invoices, clients, payments and reports, on top of this server.
 
 </div>
+
+## Claude Code plugin
+
+Using Claude Code? [invoiceninja-plugin](https://invoiceninja-plugin.marceltov.de/) adds skills that call these tools (find clients, create and send invoices, record payments, run reports) and registers this server for you.
 
 ## Why a sidecar
 

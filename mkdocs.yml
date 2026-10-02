@@ -70,6 +70,7 @@ nav:
           - adr/0001-load-spec-matching-instance-version.md
           - adr/0002-treat-openapi-spec-as-hints.md
   - Contributing: contributing.md
+  - invoiceninja-plugin (Claude Code skills): https://invoiceninja-plugin.marceltov.de/
 
 extra_css:
   - stylesheets/extra.css

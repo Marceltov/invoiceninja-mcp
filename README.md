@@ -50,6 +50,10 @@ The `--scope user` flag registers the server across **all** your projects. Drop 
 
 Alternatively, use the provided [`.mcp.json`](.mcp.json), filling in your host and token.
 
+## Claude Code plugin
+
+Using Claude Code? [invoiceninja-plugin](https://github.com/Marceltov/invoiceninja-plugin) adds ready-made skills (clients, invoices, payments, reports) on top of this server and registers it for you.
+
 ## Configuration
 
 All configuration is via environment variables:
