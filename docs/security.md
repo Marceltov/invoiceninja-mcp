@@ -18,5 +18,6 @@
 - Each client gets its own token, revocable on its own. See [Connecting clients](connecting.md#revoking-access) for the archived-token caveat.
 - Remote OAuth needs an HTTPS `MCP_BASE_URL` (localhost excepted), so put TLS in front. Access tokens bound to another resource are rejected here (audience check).
 - Dynamic Client Registration lets anyone register a client and send you a genuine login link. The page shows the client name and redirect host, but there is no allowlist: only log in to connections you started.
+- `attachDocumentFromUrl` makes the server fetch URLs. It is off unless `MCP_FETCH_ALLOWED_HOSTS` is set, fetches only `https` on those hosts, never follows redirects (so an allowed host can't bounce it into the internal network), caps downloads at 25 MB, and uses a separate HTTP client that never carries the InvoiceNinja token.
 - The plain-HTTP `POST /upload/{entity}/{id}` route is gated in `oauth` and `both` modes by `UploadAuthMiddleware`, which verifies the bearer itself and forwards the minted token. Requests without a valid one get `401`.
 - Keep `MCP_OAUTH_SECRET` private and the `/data` volume backed up. Losing or changing the secret logs every client out.
