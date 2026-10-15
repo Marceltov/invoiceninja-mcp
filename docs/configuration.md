@@ -4,7 +4,7 @@ All configuration is via environment variables.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `INVOICENINJA_SERVER_URL` | `http://invoiceninja:80` | Base URL of the InvoiceNinja instance, used **as-is** (the spec's paths already include `/api/v1`, so no suffix is appended). |
+| `INVOICENINJA_SERVER_URL` | `http://invoiceninja:80` | Base URL of the Invoice Ninja instance, used **as-is** (the spec's paths already include `/api/v1`, so no suffix is appended). |
 | `MCP_HOST` | `0.0.0.0` | Interface the MCP server binds to. |
 | `MCP_PORT` | `8081` | Port the MCP server listens on. |
 | `MCP_PATH` | `/mcp` | HTTP path the MCP endpoint is served at. |
@@ -36,7 +36,7 @@ With both variables set the mode defaults to `both`: OAuth clients and raw-token
 
 ## Which API spec is used
 
-Tools are generated from the OpenAPI spec matching **your** InvoiceNinja version. At startup the server:
+Tools are generated from the OpenAPI spec matching **your** Invoice Ninja version. At startup the server:
 
 1. Uses `INVOICENINJA_API_SPEC` if set.
 2. Otherwise reads `X-APP-VERSION` from an unauthenticated `/api/v1/ping` and downloads that release's spec from `raw.githubusercontent.com/invoiceninja/invoiceninja/v<version>/openapi/api-docs.yaml`.

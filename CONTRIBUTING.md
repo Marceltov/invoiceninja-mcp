@@ -11,7 +11,7 @@
 
 ## Local development environment
 
-The repo ships a ready-to-run dev stack: a throwaway InvoiceNinja instance (app + nginx + mysql + redis), plus the MCP server built from local source.
+The repo ships a ready-to-run dev stack: a throwaway Invoice Ninja instance (app + nginx + mysql + redis), plus the MCP server built from local source.
 
 ```bash
 docker compose up -d --build --wait
@@ -23,7 +23,7 @@ This starts five services (see [`docker-compose.yaml`](docker-compose.yaml)):
 | Service | URL | Notes |
 | --- | --- | --- |
 | `invoiceninja` (nginx) | http://localhost:8082 | Web UI + API (`/api/v1`) |
-| `app` | (internal only) | PHP-FPM, InvoiceNinja itself |
+| `app` | (internal only) | PHP-FPM, Invoice Ninja itself |
 | `mysql` / `redis` | (internal only) | App datastores |
 | `invoiceninja-mcp` | http://localhost:8081/mcp | MCP endpoint (built from local `Dockerfile`) |
 
@@ -39,7 +39,7 @@ curl http://localhost:8081/health   # -> ok
 
 All **committed dev fixture** values, scoped to this disposable instance only — do not reuse them anywhere real.
 
-- **InvoiceNinja web UI:** http://localhost:8082, log in with `admin@example.com` / `invoiceninja-mcp-dev`.
+- **Invoice Ninja web UI:** http://localhost:8082, log in with `admin@example.com` / `invoiceninja-mcp-dev`.
 - **API token:** not committed (unlike trillium-mcp's `etapi.token`) — a fresh container boot creates a new admin user, so the token can't be static. Run `python3 scripts/mint_dev_token.py` after bringing the stack up; it writes to [`invoiceninja.token`](invoiceninja.token) (gitignored).
 
 ### Talking to the MCP server
@@ -66,7 +66,7 @@ python3 scripts/mint_dev_token.py
 
 Tests live in `app/tests/` and come in two kinds:
 
-- **Unit tests** (`app/tests/test_*.py`) run against a mock InvoiceNinja transport — no running InvoiceNinja required.
+- **Unit tests** (`app/tests/test_*.py`) run against a mock Invoice Ninja transport — no running Invoice Ninja required.
 - **Live integration tests** (`app/tests/live/`) drive the real MCP server over HTTP against the running stack. They **auto-skip** when the MCP `/health` endpoint is unreachable.
 
 ### The easy way: `run-tests.sh`
@@ -92,4 +92,4 @@ Without the stack up, the live tests skip and the unit tests still run.
 
 ## Tools generated from the OpenAPI spec
 
-Most MCP tools are generated automatically from [`app/invoiceninja-api-docs.yaml`](app/invoiceninja-api-docs.yaml) via `FastMCP.from_openapi`. `login`/`logout` are excluded outright, and `uploadClient` is excluded and replaced with a hand-written tool that base64-decodes file content and sends it as multipart form data with a `_method: "PUT"` field, matching InvoiceNinja's actual (PUT, not POST as the spec claims) route for that endpoint (see `app/server.py`). If you special-case another endpoint, cover it with a live test under `app/tests/live/` and add its operationId to `app/tests/test_coverage.py`'s `_TESTED_OPERATIONS`.
+Most MCP tools are generated automatically from [`app/invoiceninja-api-docs.yaml`](app/invoiceninja-api-docs.yaml) via `FastMCP.from_openapi`. `login`/`logout` are excluded outright, and `uploadClient` is excluded and replaced with a hand-written tool that base64-decodes file content and sends it as multipart form data with a `_method: "PUT"` field, matching Invoice Ninja's actual (PUT, not POST as the spec claims) route for that endpoint (see `app/server.py`). If you special-case another endpoint, cover it with a live test under `app/tests/live/` and add its operationId to `app/tests/test_coverage.py`'s `_TESTED_OPERATIONS`.

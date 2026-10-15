@@ -1,18 +1,18 @@
-# InvoiceNinja MCP server
+# Invoice Ninja MCP server
 
-A standalone [MCP](https://modelcontextprotocol.io) server that exposes the [InvoiceNinja](https://invoiceninja.com) v5 REST API as MCP tools. It runs as a **container sidecar** next to your InvoiceNinja instance: nearly every documented API endpoint is turned into an MCP tool at startup via `FastMCP.from_openapi` (**377 tools** against InvoiceNinja 5.13.43, generated from the spec's 379 documented operations — `storeInvoice`, `getClients`, `showInvoice`, `storeClient`, …; the session endpoints `login`/`logout` are excluded), served over streamable **HTTP** so any MCP client connects to it by URL.
+A standalone [MCP](https://modelcontextprotocol.io) server that exposes the [Invoice Ninja](https://invoiceninja.com) v5 REST API as MCP tools. It runs as a **container sidecar** next to your Invoice Ninja instance: nearly every documented API endpoint is turned into an MCP tool at startup via `FastMCP.from_openapi` (**377 tools** against Invoice Ninja 5.13.43, generated from the spec's 379 documented operations — `storeInvoice`, `getClients`, `showInvoice`, `storeClient`, …; the session endpoints `login`/`logout` are excluded), served over streamable **HTTP** so any MCP client connects to it by URL.
 
-InvoiceNinja's published API spec is inaccurate in places (missing fields, wrong types, over-strict required lists), so the generated tools treat it as a hint: request bodies require nothing up front and responses aren't validated against it — InvoiceNinja's own validation errors come back instead. For anything a generated tool can't express, the **`apiRequest`** tool calls any `/api/v1/...` endpoint directly with your token.
+Invoice Ninja's published API spec is inaccurate in places (missing fields, wrong types, over-strict required lists), so the generated tools treat it as a hint: request bodies require nothing up front and responses aren't validated against it — Invoice Ninja's own validation errors come back instead. For anything a generated tool can't express, the **`apiRequest`** tool calls any `/api/v1/...` endpoint directly with your token.
 
 ## Architecture
 
-**invoiceninja-mcp** (this repo) runs as a container sidecar and talks to InvoiceNinja over the internal Docker network, so InvoiceNinja's API is never exposed publicly on its own. Clients reach invoiceninja-mcp either through a TLS-terminating reverse proxy or directly over a trusted LAN — in both cases the credential they present (an API token, or an OAuth login that mints one) is what InvoiceNinja checks.
+The **Invoice Ninja MCP server** (this repo) runs as a container sidecar and talks to Invoice Ninja over the internal Docker network, so Invoice Ninja's API is never exposed publicly on its own. Clients reach the Invoice Ninja MCP server either through a TLS-terminating reverse proxy or directly over a trusted LAN — in both cases the credential they present (an API token, or an OAuth login that mints one) is what Invoice Ninja checks.
 
 ## Quick start
 
-**1. Create an API token in InvoiceNinja** — *Settings → Account Management → Integrations → API tokens*. In token mode this is the only credential: invoiceninja-mcp stores no secret and forwards it to InvoiceNinja as `X-API-TOKEN` (alongside a required `X-Requested-With: XMLHttpRequest` header). Each client presents its own token per request.
+**1. Create an API token in Invoice Ninja** — *Settings → Account Management → Integrations → API tokens*. In token mode this is the only credential: the Invoice Ninja MCP server stores no secret and forwards it to Invoice Ninja as `X-API-TOKEN` (alongside a required `X-Requested-With: XMLHttpRequest` header). Each client presents its own token per request.
 
-**2. Add invoiceninja-mcp to your InvoiceNinja's `docker-compose.yaml`** — one service, pulling the prebuilt image, so there's nothing to clone or build:
+**2. Add the Invoice Ninja MCP server to your Invoice Ninja's `docker-compose.yaml`** — one service, pulling the prebuilt image, so there's nothing to clone or build:
 
 ```yaml
 services:
@@ -36,7 +36,7 @@ Then start it:
 docker compose up -d invoiceninja-mcp
 ```
 
-Both services share the compose network, so `invoiceninja` resolves to your existing container. If your InvoiceNinja runs elsewhere (a separate compose project or host), point `INVOICENINJA_SERVER_URL` at a URL this container can reach and attach it to the right network. The MCP endpoint is then available at `http://localhost:8081/mcp`.
+Both services share the compose network, so `invoiceninja` resolves to your existing container. If your Invoice Ninja instance runs elsewhere (a separate compose project or host), point `INVOICENINJA_SERVER_URL` at a URL this container can reach and attach it to the right network. The MCP endpoint is then available at `http://localhost:8081/mcp`.
 
 **3. Connect your MCP client** with the token from step 1:
 
@@ -60,7 +60,7 @@ All configuration is via environment variables:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `INVOICENINJA_SERVER_URL` | `http://invoiceninja:80` | Base URL of the InvoiceNinja instance, used **as-is** (the spec's own paths already include `/api/v1`, so no suffix is appended). |
+| `INVOICENINJA_SERVER_URL` | `http://invoiceninja:80` | Base URL of the Invoice Ninja instance, used **as-is** (the spec's own paths already include `/api/v1`, so no suffix is appended). |
 | `MCP_HOST` | `0.0.0.0` | Interface the MCP server binds to. |
 | `MCP_PORT` | `8081` | Port the MCP server listens on. |
 | `MCP_PATH` | `/mcp` | HTTP path the MCP endpoint is served at. |
@@ -75,7 +75,7 @@ OAuth login (so app clients connect with only the URL) additionally needs a `/da
 
 ### Which API spec is used
 
-The tools are generated from the OpenAPI spec that matches **your** InvoiceNinja version. At startup the server reads the instance's version from the `X-APP-VERSION` header of an unauthenticated `/api/v1/ping` and downloads that release's spec from `raw.githubusercontent.com/invoiceninja/invoiceninja/v<version>/openapi/api-docs.yaml`. If that fails (no internet, instance not up, unknown version), it falls back to the bundled spec (currently 5.13.43) and logs a warning. Set `INVOICENINJA_API_SPEC` to pin a file instead, e.g. for offline setups; any InvoiceNinja image contains its own at `/var/www/html/openapi/api-docs.yaml`.
+The tools are generated from the OpenAPI spec that matches **your** Invoice Ninja version. At startup the server reads the instance's version from the `X-APP-VERSION` header of an unauthenticated `/api/v1/ping` and downloads that release's spec from `raw.githubusercontent.com/invoiceninja/invoiceninja/v<version>/openapi/api-docs.yaml`. If that fails (no internet, instance not up, unknown version), it falls back to the bundled spec (currently 5.13.43) and logs a warning. Set `INVOICENINJA_API_SPEC` to pin a file instead, e.g. for offline setups; any Invoice Ninja image contains its own at `/var/www/html/openapi/api-docs.yaml`.
 
 ## TLS / reverse proxy
 
@@ -89,7 +89,7 @@ your-host {
 
 ## Security
 
-The MCP endpoint grants **full access to your InvoiceNinja account** — whatever the token's permissions allow. Every request must carry a valid API token in the `Authorization` header; requests with no `Authorization` header at all are rejected with `401` before reaching any tool. The server never validates the token itself — validity is enforced by InvoiceNinja when the forwarded request reaches the actual API call, and in token mode the server holds no secret of its own (in `oauth`/`both` modes it stores OAuth registrations and the tokens it minted, encrypted at rest). The `/health` endpoint is always unauthenticated (used by the container healthcheck).
+The MCP endpoint grants **full access to your Invoice Ninja instance account** — whatever the token's permissions allow. Every request must carry a valid API token in the `Authorization` header; requests with no `Authorization` header at all are rejected with `401` before reaching any tool. The server never validates the token itself — validity is enforced by Invoice Ninja when the forwarded request reaches the actual API call, and in token mode the server holds no secret of its own (in `oauth`/`both` modes it stores OAuth registrations and the tokens it minted, encrypted at rest). The `/health` endpoint is always unauthenticated (used by the container healthcheck).
 
 The token is sent as `X-API-TOKEN` (alongside `X-Requested-With: XMLHttpRequest`) on every call. Over plain HTTP it travels in cleartext, so either keep traffic on a **trusted network** (e.g. a LAN or the Docker network) or put TLS in front.
 
@@ -99,11 +99,11 @@ If the OpenAPI spec cannot be loaded at startup, the server still starts and com
 
 ## How it works
 
-`TokenCaptureMiddleware` requires an `Authorization` header on the MCP path and stashes it in a contextvar; `InvoiceNinjaTokenAuth` reads it on the outgoing call, strips a leading `Bearer ` if present, and sets it as `X-API-TOKEN`, alongside a fixed `X-Requested-With: XMLHttpRequest` header. Validity is enforced by InvoiceNinja itself — this server never validates an API token. In `oauth`/`both` modes an OAuth login with the user's InvoiceNinja email and password mints a per-client token (`MCP: <client>`) that is forwarded the same way.
+`TokenCaptureMiddleware` requires an `Authorization` header on the MCP path and stashes it in a contextvar; `InvoiceNinjaTokenAuth` reads it on the outgoing call, strips a leading `Bearer ` if present, and sets it as `X-API-TOKEN`, alongside a fixed `X-Requested-With: XMLHttpRequest` header. Validity is enforced by Invoice Ninja itself — this server never validates an API token. In `oauth`/`both` modes an OAuth login with the user's Invoice Ninja email and password mints a per-client token (`MCP: <client>`) that is forwarded the same way.
 
 ## Contributing
 
-For local development there's a ready-to-run stack — a throwaway InvoiceNinja instance plus the MCP server built from local source. See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and how to run the tests.
+For local development there's a ready-to-run stack — a throwaway Invoice Ninja instance plus the MCP server built from local source. See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and how to run the tests.
 
 ## License
 

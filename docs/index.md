@@ -1,8 +1,8 @@
-# InvoiceNinja MCP
+# Invoice Ninja MCP
 
-A standalone [MCP](https://modelcontextprotocol.io) server that exposes the [InvoiceNinja](https://invoiceninja.com) v5 REST API as MCP tools, so any MCP client (Claude Code, Claude Desktop, …) can manage clients, invoices, quotes, payments and more.
+A standalone [MCP](https://modelcontextprotocol.io) server that exposes the [Invoice Ninja](https://invoiceninja.com) v5 REST API as MCP tools, so any MCP client (Claude Code, Claude Desktop, …) can manage clients, invoices, quotes, payments and more.
 
-It runs as a **container sidecar** next to your InvoiceNinja instance and serves **streamable HTTP**. Nearly every documented API endpoint becomes a tool at startup: **377 tools** against InvoiceNinja 5.13.43, generated from the spec's 379 operations (`login`/`logout` are excluded).
+It runs as a **container sidecar** next to your Invoice Ninja instance and serves **streamable HTTP**. Nearly every documented API endpoint becomes a tool at startup: **377 tools** against Invoice Ninja 5.13.43, generated from the spec's 379 operations (`login`/`logout` are excluded).
 
 <div class="grid cards" markdown>
 
@@ -20,7 +20,7 @@ Using Claude Code? [invoiceninja-plugin](https://invoiceninja-plugin.marceltov.d
 
 ## Why a sidecar
 
-InvoiceNinja's API stays on the internal Docker network. Clients reach the MCP server through a TLS-terminating reverse proxy or a trusted LAN, and the credential they present (an API token, or an OAuth login that mints one) is what InvoiceNinja checks.
+Invoice Ninja's API stays on the internal Docker network. Clients reach the MCP server through a TLS-terminating reverse proxy or a trusted LAN, and the credential they present (an API token, or an OAuth login that mints one) is what Invoice Ninja checks.
 
 ## License
 

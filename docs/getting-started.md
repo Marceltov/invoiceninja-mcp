@@ -2,11 +2,11 @@
 
 ## 1. Create an API token
 
-In InvoiceNinja go to *Settings → Account Management → Integrations → API tokens*. This is the only credential in token mode: the server stores no secret and forwards your token to InvoiceNinja as `X-API-TOKEN`. Each client presents its own token per request.
+In Invoice Ninja go to *Settings → Account Management → Integrations → API tokens*. This is the only credential in token mode: the server stores no secret and forwards your token to Invoice Ninja as `X-API-TOKEN`. Each client presents its own token per request.
 
 ## 2. Add the sidecar
 
-Add one service to your InvoiceNinja `docker-compose.yaml`. It uses the prebuilt image, so there is nothing to clone or build.
+Add one service to your Invoice Ninja instance `docker-compose.yaml`. It uses the prebuilt image, so there is nothing to clone or build.
 
 ```yaml
 services:
@@ -29,7 +29,7 @@ docker compose up -d invoiceninja-mcp
 curl http://localhost:8081/health   # -> ok
 ```
 
-If InvoiceNinja runs elsewhere, point `INVOICENINJA_SERVER_URL` at a URL the container can reach and attach it to the right network. The MCP endpoint is `http://localhost:8081/mcp`.
+If Invoice Ninja runs elsewhere, point `INVOICENINJA_SERVER_URL` at a URL the container can reach and attach it to the right network. The MCP endpoint is `http://localhost:8081/mcp`.
 
 ## 3. Connect a client
 
