@@ -1,10 +1,10 @@
 # Connecting clients
 
-A client can authenticate in two ways: with an InvoiceNinja API token it sends itself, or with OAuth, where it only needs the URL and you log in in the browser. OAuth needs the server configured for it, see [Configuration](configuration.md#oauth).
+A client can authenticate in two ways: with an Invoice Ninja API token it sends itself, or with OAuth, where it only needs the URL and you log in in the browser. OAuth needs the server configured for it, see [Configuration](configuration.md#oauth).
 
 ## With an API token
 
-Create a token in InvoiceNinja (*Settings → Account Management → Integrations → API tokens*) and give it to the client in the `Authorization` header.
+Create a token in Invoice Ninja (*Settings → Account Management → Integrations → API tokens*) and give it to the client in the `Authorization` header.
 
 ```bash
 claude mcp add invoiceninja --scope user --transport http \
@@ -12,7 +12,7 @@ claude mcp add invoiceninja --scope user --transport http \
   --header "Authorization: YOUR_INVOICENINJA_API_TOKEN"
 ```
 
-This works in the `token` and `both` auth modes. In `both`, any bearer that does not start with `inmcp_` is forwarded to InvoiceNinja as a raw token.
+This works in the `token` and `both` auth modes. In `both`, any bearer that does not start with `inmcp_` is forwarded to Invoice Ninja as a raw token.
 
 ## With OAuth
 
@@ -26,7 +26,7 @@ Then authenticate in the browser (in Claude Code run `/mcp` and pick the server)
 
 The login page asks for:
 
-* **Email** and **password** of your InvoiceNinja account.
+* **Email** and **password** of your Invoice Ninja instance account.
 * **2FA code**, only if your account has it enabled. This field exists but 2FA login was not tested against a real instance.
 
 !!! note "Accounts without a password login"
