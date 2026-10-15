@@ -71,7 +71,7 @@ If the OpenAPI spec can't be loaded, `main()` falls back to `build_error_server(
 
 ### Configuration
 
-All config is environment variables (no CLI args): `INVOICENINJA_SERVER_URL` (used as-is; the spec's own paths already include `/api/v1`), `MCP_HOST`, `MCP_PORT`, `MCP_PATH`, `INVOICENINJA_API_SPEC`, `MCP_ALLOWED_HOSTS`, `MCP_AUTH_MODE`, `MCP_BASE_URL`, `MCP_OAUTH_SECRET` (OAuth; see above).
+All config is environment variables (no CLI args): `INVOICENINJA_SERVER_URL` (used as-is; the spec's own paths already include `/api/v1`), `MCP_HOST`, `MCP_PORT`, `MCP_PATH`, `INVOICENINJA_API_SPEC`, `MCP_ALLOWED_HOSTS`, `MCP_AUTH_MODE`, `MCP_BASE_URL`, `MCP_OAUTH_SECRET` (OAuth; see above), `MCP_FETCH_ALLOWED_HOSTS` (enables `attachDocumentFromUrl`).
 
 ## Dev fixture credentials
 

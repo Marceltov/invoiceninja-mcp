@@ -29,6 +29,19 @@ The spec documents `POST /clients/{id}/upload` with binary multipart parts, whic
 | `filename` | Name to store the file under; the type is inferred from the extension. |
 | `content_base64` | Base64-encoded file contents. |
 
+## `attachDocumentFromUrl`
+
+The server downloads a file and attaches it to any entity with a `/{id}/upload` route, so the bytes never pass through the model. Meant for clients that can't reach the upload route below, such as a claude.ai connector: pass a Paperless-ngx share link and the expense id. Only registered when `MCP_FETCH_ALLOWED_HOSTS` is set.
+
+| Argument | Description |
+| --- | --- |
+| `entity` | Collection name: `expenses`, `invoices`, `vendors`, … |
+| `id` | Entity id. |
+| `url` | `https` URL on an allowed host. Redirects are not followed. |
+| `filename` | Optional; defaults to the download's `Content-Disposition` name or the URL's last segment. |
+
+Files over 25 MB are refused. Returns `{"status", "filename", "size", "body"}` with InvoiceNinja's response.
+
 ## File upload route: `POST /upload/{entity}/{id}`
 
 A plain HTTP endpoint (not an MCP tool) for attaching files to any entity that has a `/{id}/upload` route in the spec: `expenses`, `invoices`, `quotes`, `payments`, `vendors`, … Base64 inside a tool call is impractical for a receipt photo or PDF, so send the bytes directly. It needs the same `Authorization` header as the MCP endpoint, is served next to it (same host and port), and forwards the files to InvoiceNinja the way `uploadClient` does.

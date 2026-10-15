@@ -10,6 +10,7 @@ All configuration is via environment variables.
 | `MCP_PATH` | `/mcp` | HTTP path the MCP endpoint is served at. |
 | `INVOICENINJA_API_SPEC` | *(unset)* | Path to a fixed OpenAPI spec file; skips the version-matched download. |
 | `MCP_ALLOWED_HOSTS` | *(unset = any)* | Comma-separated `Host` allowlist (DNS-rebinding protection). |
+| `MCP_FETCH_ALLOWED_HOSTS` | *(unset = tool off)* | Comma-separated hosts `attachDocumentFromUrl` may download from over https, e.g. `paperless.example.com`. |
 | `MCP_AUTH_MODE` | *(unset)* | `token`, `oauth` or `both`. Unset means `both` when `MCP_BASE_URL` and `MCP_OAUTH_SECRET` are set, else `token`. |
 | `MCP_BASE_URL` | *(unset)* | Public HTTPS URL clients use to reach the server (the OAuth issuer). `localhost` may use http. |
 | `MCP_OAUTH_SECRET` | *(unset)* | Any long random string. Encrypts the OAuth store at rest at `/data/oauth`. Changing it logs every client out. |

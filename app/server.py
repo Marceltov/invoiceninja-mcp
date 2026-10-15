@@ -26,7 +26,7 @@ import time
 import traceback
 from contextvars import ContextVar
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import httpx
 import uvicorn
@@ -72,11 +72,13 @@ MCP_ALLOWED_HOSTS_ENV = "MCP_ALLOWED_HOSTS"  # comma-separated Host allowlist
 AUTH_MODE_ENV = "MCP_AUTH_MODE"            # token | oauth | both (see resolve_auth_mode)
 BASE_URL_ENV = "MCP_BASE_URL"              # public URL clients reach us at (OAuth issuer)
 OAUTH_SECRET_ENV = "MCP_OAUTH_SECRET"      # encrypts the OAuth store at rest
+FETCH_HOSTS_ENV = "MCP_FETCH_ALLOWED_HOSTS"  # hosts attachDocumentFromUrl may download from
 
 DEFAULT_SERVER_URL = "http://invoiceninja:80"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8081
 DEFAULT_PATH = "/mcp"
+MAX_FETCH_BYTES = 25 * 1024 * 1024
 HEALTH_PATH = "/health"
 
 AUTH_MODES = ("token", "oauth", "both")
@@ -923,6 +925,15 @@ def build_oauth_provider(mode: str) -> InvoiceNinjaOAuthProvider:
     )
 
 
+def _upload_entities(spec: dict) -> set[str]:
+    """Entities with a `/{id}/upload` route in the spec (expenses, invoices, ...)."""
+    return {
+        m.group(1)
+        for path in spec.get("paths", {})
+        if (m := re.fullmatch(r"/api/v1/([a-z_]+)/\{id\}/upload", path))
+    }
+
+
 def register_upload_route(mcp: FastMCP, client: httpx.AsyncClient, spec: dict) -> None:
     """Add `POST /upload/{entity}/{id}`: a plain multipart endpoint for attaching
     files to any InvoiceNinja entity that has a `/{id}/upload` route.
@@ -935,11 +946,7 @@ def register_upload_route(mcp: FastMCP, client: httpx.AsyncClient, spec: dict) -
     does: a POST carrying `_method=PUT`. Only entities whose upload route is in
     the spec are accepted.
     """
-    entities = {
-        m.group(1)
-        for path in spec.get("paths", {})
-        if (m := re.fullmatch(r"/api/v1/([a-z_]+)/\{id\}/upload", path))
-    }
+    entities = _upload_entities(spec)
 
     @mcp.custom_route("/upload/{entity}/{id}", methods=["POST"])
     async def upload(request: Request):
@@ -963,6 +970,88 @@ def register_upload_route(mcp: FastMCP, client: httpx.AsyncClient, spec: dict) -
             else {"body": response.text},
             response.status_code,
         )
+
+
+def _fetch_allowed_hosts() -> set[str]:
+    raw = os.environ.get(FETCH_HOSTS_ENV, "")
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
+def _download_filename(response: httpx.Response, url: str) -> str:
+    disposition = response.headers.get("content-disposition", "")
+    if m := re.search(r"filename\*=UTF-8''([^;]+)", disposition, re.I):
+        return unquote(m.group(1))
+    if m := re.search(r'filename="?([^";]+)"?', disposition, re.I):
+        return m.group(1)
+    return unquote(urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1]) or "download"
+
+
+def register_attach_from_url_tool(
+    mcp: FastMCP,
+    client: httpx.AsyncClient,
+    spec: dict,
+    fetcher: httpx.AsyncClient | None = None,
+) -> None:
+    """Register attachDocumentFromUrl: the server downloads a file and uploads
+    it to an entity, so the bytes never pass through the model.
+
+    The `/upload/{entity}/{id}` route needs the caller to hold the file and the
+    bearer, which a claude.ai connector session has neither of; base64 in a
+    tool call costs about a token per byte. Fetching server-side fixes both,
+    e.g. from a Paperless-ngx share link. Only registered when
+    MCP_FETCH_ALLOWED_HOSTS is set, and only https URLs on those hosts are
+    fetched, without following redirects, so the tool can't be aimed at the
+    internal network. The fetcher is a separate client without
+    InvoiceNinjaTokenAuth: the caller's token must never leave for the
+    download host.
+    """
+    hosts = _fetch_allowed_hosts()
+    if not hosts:
+        return
+    entities = _upload_entities(spec)
+    fetcher = fetcher or httpx.AsyncClient(timeout=60, follow_redirects=False)
+
+    @mcp.tool(name="attachDocumentFromUrl")
+    async def attach_document_from_url(
+        entity: str, id: str, url: str, filename: str | None = None
+    ) -> dict:
+        """Download a file from `url` and attach it to an InvoiceNinja entity.
+
+        `entity` is the API collection name, e.g. "expenses", "invoices",
+        "vendors". `url` must be https on a host listed in
+        MCP_FETCH_ALLOWED_HOSTS (e.g. a Paperless-ngx share link). `filename`
+        overrides the name taken from the download; InvoiceNinja infers the
+        file type from its extension. Returns {"status", "filename", "size",
+        "body"} with InvoiceNinja's response.
+        """
+        if entity not in entities:
+            raise ValueError(f"cannot upload to {entity!r}; one of {sorted(entities)}")
+        if not re.fullmatch(r"[A-Za-z0-9]+", id):
+            raise ValueError(f"invalid id {id!r}")
+        parts = urlsplit(url)
+        if parts.scheme != "https" or (parts.hostname or "").lower() not in hosts:
+            raise ValueError(f"url must be https on one of {sorted(hosts)}")
+
+        async with fetcher.stream("GET", url) as download:
+            if download.status_code != 200:
+                raise ValueError(f"download failed: HTTP {download.status_code}")
+            content = b""
+            async for chunk in download.aiter_bytes():
+                content += chunk
+                if len(content) > MAX_FETCH_BYTES:
+                    raise ValueError(f"file is larger than {MAX_FETCH_BYTES} bytes")
+            name = filename or _download_filename(download, url)
+            content_type = download.headers.get("content-type", "application/octet-stream")
+
+        response = await client.post(
+            f"/api/v1/{entity}/{id}/upload",
+            files=[("documents[]", (name, content, content_type)), ("_method", (None, "PUT"))],
+        )
+        try:
+            body = response.json()
+        except ValueError:
+            body = response.text
+        return {"status": response.status_code, "filename": name, "size": len(content), "body": body}
 
 
 _API_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
@@ -1078,13 +1167,15 @@ def build_server(
     client: httpx.AsyncClient | None = None,
     spec: dict | None = None,
     auth: InvoiceNinjaOAuthProvider | None = None,
+    fetcher: httpx.AsyncClient | None = None,
 ) -> FastMCP:
     """Load the local OpenAPI spec and turn every documented InvoiceNinja
     endpoint into a FastMCP tool. The API token is supplied per request by the
     client (see TokenCaptureMiddleware / InvoiceNinjaTokenAuth), so no token
     is read here.
 
-    `client` is injectable for testing; in production the default client
+    `client` (and `fetcher`, the download client of attachDocumentFromUrl)
+    are injectable for testing; in production the default client
     targets INVOICENINJA_SERVER_URL and authenticates from the per-request
     contextvar. `auth` enables OAuth; None keeps plain token pass-through.
     """
@@ -1134,6 +1225,7 @@ def build_server(
     )
     register_upload_client_tool(mcp, client)
     register_upload_route(mcp, client, spec)
+    register_attach_from_url_tool(mcp, client, spec, fetcher)
     register_api_request_tool(mcp, client)
     register_health(mcp)
     return mcp
