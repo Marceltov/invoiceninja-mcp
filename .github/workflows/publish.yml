@@ -1,6 +1,7 @@
 name: Publish image
 
-# Build the Docker image and push it to GitHub Container Registry (GHCR).
+# Run the unit tests, then build the Docker image and push it to GitHub
+# Container Registry (GHCR).
 # Auth uses the built-in GITHUB_TOKEN — no secrets to configure.
 
 on:
@@ -17,7 +18,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    # Unit tests only: tests/live/ skips itself without the docker-compose stack.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run pytest -q
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

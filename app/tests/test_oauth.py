@@ -452,7 +452,7 @@ async def oauth_access_token(http) -> str:
     pending = httpx.URL(r.headers["location"]).params["id"]
     r = await http.post("/login", data={"id": pending, "email": "a@b.c", "password": "pw"})
     back = httpx.URL(r.headers["location"])
-    assert back.params["state"] == "s1" and back.params["iss"] == "http://localhost"
+    assert back.params["state"] == "s1" and back.params["iss"] == "http://localhost/"
     r = await http.post("/token", data={
         "grant_type": "authorization_code", "code": back.params["code"],
         "redirect_uri": REDIRECT, "client_id": client_id,
