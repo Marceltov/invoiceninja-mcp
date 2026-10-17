@@ -352,6 +352,10 @@ class InvoiceNinjaOAuthProvider(OAuthProvider):
         data = await self.store.get(refresh_token.token, collection="refresh")
         if not data:
             raise TokenError("invalid_grant", "Refresh token not found or already used.")
+        if not self._resource_ok(data.get("resource")):
+            # Bound to our old URL (MCP_BASE_URL changed): its access tokens
+            # would never verify, so make the client log in again.
+            raise TokenError("invalid_grant", "Refresh token was issued for another resource.")
         if not set(scopes) <= set(refresh_token.scopes):
             raise TokenError("invalid_scope", "Requested scopes exceed the original grant.")
         # Rotate: the old pair dies, the minted API token lives on in the new one.
@@ -550,11 +554,13 @@ class InvoiceNinjaOAuthProvider(OAuthProvider):
             collection="codes",
             ttl=AUTH_CODE_TTL,
         )
-        # RFC 9207: tell the client which authorization server answered.
+        # RFC 9207: tell the client which authorization server answered. Clients
+        # compare it byte for byte with the metadata's `issuer`, trailing slash
+        # included, so send exactly that.
         return RedirectResponse(
             construct_redirect_uri(
                 redirect, code=code.code, state=params.state,
-                iss=str(self.base_url).rstrip("/"),
+                iss=str(self.issuer_url),
             ),
             status_code=302,
         )

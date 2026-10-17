@@ -203,6 +203,19 @@ def test_access_token_is_bound_to_this_resource(resource, ok):
     assert (asyncio.run(p.verify_token(tok.access_token)) is not None) is ok
 
 
+def test_refresh_bound_to_another_resource_is_rejected():
+    p, _ = make_provider()
+    tok = issue(p, resource="http://other.example/mcp")
+
+    async def go():
+        await p.register_client(CLIENT)
+        rt = await p.load_refresh_token(CLIENT, tok.refresh_token)
+        return await p.exchange_refresh_token(CLIENT, rt, [])
+
+    with pytest.raises(server.TokenError):
+        asyncio.run(go())
+
+
 def test_registered_client_round_trips():
     p, _ = make_provider()
 
@@ -274,7 +287,8 @@ def test_login_mints_named_token_and_redirects_with_code_state_and_iss():
     assert r.status_code == 302
     back = httpx.URL(r.headers["location"])
     assert back.params["state"] == "s1"
-    assert back.params["iss"] == "http://localhost"
+    meta = login_client(p).get("/.well-known/oauth-authorization-server").json()
+    assert back.params["iss"] == meta["issuer"]
     assert back.params["code"].startswith(server.OAUTH_TOKEN_PREFIX)
     mint = [c for c in calls if c.url.path == "/api/v1/tokens"][0]
     assert mint.headers["X-API-TOKEN"] == "session-tok"
