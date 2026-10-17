@@ -25,6 +25,8 @@ _SPEC = _HERE.parents[1] / "invoiceninja-api-docs.yaml"  # app/invoiceninja-api-
 # getLogout (not "login"/"logout" -- confirm with `grep operationId` near
 # those paths in the spec if this ever needs re-checking).
 _EXCLUDED_OPERATIONS = {"postLogin", "getLogout"}
+# Hand-written tools in server.py that are not spec operations.
+_CUSTOM_TOOLS = {"apiRequest", "attachDocumentFromUrl", "uploadClient"}
 
 # The slice of the 365-operation surface this plan live-tests. Expand this
 # set (and add a matching live test under tests/live/) as coverage grows.
@@ -79,7 +81,7 @@ def test_no_unknown_tool_names_referenced():
             "\n".join(p.read_text() for p in _LIVE_DIR.glob("test_*.py")),
         )
     )
-    unknown = sorted(called - operations)
+    unknown = sorted(called - operations - _CUSTOM_TOOLS)
     assert not unknown, f"tests call unknown tool names: {unknown}"
 
 
