@@ -1,13 +1,14 @@
 [project]
 name = "invoiceninja_mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Standalone MCP server exposing the InvoiceNinja API over HTTP"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
-    "httpx>=0.28.1",
-    "fastmcp>=3.0.0",
+    "httpx2>=2.16",
+    "fastmcp>=4.1.3",
+    "mcp-login-oauth @ git+https://github.com/Marceltov/mcp-login-oauth@v0.2.0",
     "pyyaml>=6.0",
     "uvicorn>=0.30",
 ]
@@ -17,5 +18,7 @@ package = false
 
 [dependency-groups]
 dev = [
+    # Plain HTTP client for the live tests.
+    "httpx>=0.28.1",
     "pytest>=9.1.1",
 ]

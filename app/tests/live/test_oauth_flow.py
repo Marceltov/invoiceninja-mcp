@@ -1,5 +1,6 @@
 """OAuth login end to end against the dev stack: register, authorize, log in with
-the fixture credentials, call a tool with the OAuth token, then revoke."""
+the fixture credentials, call a tool with the OAuth token, then revoke. The named
+token the login mints must exist in InvoiceNinja until the revoke deletes it."""
 
 import asyncio
 import base64
@@ -10,7 +11,7 @@ import httpx
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
-from tests.live._client import MCP_URL
+from tests.live._client import MCP_URL, TOKEN
 
 EMAIL = "admin@example.com"
 PASSWORD = "invoiceninja-mcp-dev"  # committed dev fixture credential (see CLAUDE.md)
@@ -28,11 +29,24 @@ def _local(url: str) -> httpx.URL:
     return ORIGIN.copy_with(path=u.path, query=u.query)
 
 
+CLIENT_NAME = "live-oauth-test"
+
+
+async def minted_token_names() -> list[str]:
+    """Names of the active tokens in InvoiceNinja, read with the fixture's static
+    token. Deleting a token archives it (`archived_at` set), and an archived token
+    is refused (403), so only unarchived ones count."""
+    transport = StreamableHttpTransport(url=MCP_URL, headers={"Authorization": TOKEN})
+    async with Client(transport) as c:
+        result = await c.call_tool("getTokens", {})
+    return [t["name"] for t in result.structured_content["data"] if not t.get("archived_at")]
+
+
 def test_oauth_login_tool_call_and_revoke():
     async def run():
         async with httpx.AsyncClient(follow_redirects=False, timeout=30) as http:
             reg = await http.post(str(ORIGIN.copy_with(path="/register")), json={
-                "client_name": "live-oauth-test", "redirect_uris": [REDIRECT],
+                "client_name": CLIENT_NAME, "redirect_uris": [REDIRECT],
                 "token_endpoint_auth_method": "none",
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
@@ -52,7 +66,11 @@ def test_oauth_login_tool_call_and_revoke():
             r = await http.post(str(login_url.copy_with(query=None)), data={
                 "id": login_url.params["id"], "email": EMAIL, "password": PASSWORD})
             assert r.status_code == 302, r.text
-            code = httpx.URL(r.headers["location"]).params["code"]
+            back = httpx.URL(r.headers["location"])
+            meta = (await http.get(str(ORIGIN.copy_with(path="/.well-known/oauth-authorization-server")))).json()
+            assert back.params["iss"] == meta["issuer"]  # RFC 9207
+            code = back.params["code"]
+            assert f"MCP: {CLIENT_NAME}" in await minted_token_names()
             r = await http.post(str(ORIGIN.copy_with(path="/token")), data={
                 "grant_type": "authorization_code", "code": code,
                 "redirect_uri": REDIRECT, "client_id": client_id,
@@ -74,12 +92,13 @@ def test_oauth_login_tool_call_and_revoke():
             assert r.status_code != 401, r.text
             assert r.status_code == 200, r.text
 
+            # A public client revokes with its client_id alone.
             r = await http.post(str(ORIGIN.copy_with(path="/revoke")), data={
-                "token": access, "client_id": client_id,
-                "client_secret": ""})  # the SDK's /revoke requires the field even for public clients
+                "token": access, "client_id": client_id})
             assert r.status_code == 200
 
             r = await http.post(MCP_URL, headers=raw_headers, json=INIT)
             assert r.status_code == 401, f"revoked token: {r.status_code} {r.text}"
+            assert f"MCP: {CLIENT_NAME}" not in await minted_token_names()
 
     asyncio.run(run())

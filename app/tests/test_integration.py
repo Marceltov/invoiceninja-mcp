@@ -1,6 +1,6 @@
 import asyncio
 
-import httpx
+import httpx2
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
@@ -14,19 +14,19 @@ def test_full_chain_forwards_token_as_x_api_token():
     end-to-end."""
     captured = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         captured["x_api_token"] = request.headers.get("X-API-TOKEN")
         captured["authorization"] = request.headers.get("Authorization")
         # Exact path, not endswith: the spec's own path keys already include
         # /api/v1, so base_url below is the bare root (see build_server).
         if request.url.path == "/api/v1/clients":
-            return httpx.Response(200, json={"data": [], "meta": {"pagination": {}}})
-        return httpx.Response(404, json={"message": "not found"})
+            return httpx2.Response(200, json={"data": [], "meta": {"pagination": {}}})
+        return httpx2.Response(404, json={"message": "not found"})
 
-    backend = httpx.AsyncClient(
+    backend = httpx2.AsyncClient(
         base_url="http://invoiceninja:80",
         auth=server.InvoiceNinjaTokenAuth(),
-        transport=httpx.MockTransport(handler),
+        transport=httpx2.MockTransport(handler),
     )
     mcp = server.build_server(client=backend)
     inner = mcp.http_app(path=server.DEFAULT_PATH)
@@ -34,8 +34,8 @@ def test_full_chain_forwards_token_as_x_api_token():
 
     def factory(**kw):
         kw.pop("transport", None)
-        return httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=wrapped),
+        return httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=wrapped),
             base_url="http://test", **kw,
         )
 

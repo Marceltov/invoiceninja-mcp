@@ -19,18 +19,15 @@ concurrency:
 
 jobs:
   test:
-    # Unit tests only: tests/live/ skips itself without the docker-compose stack.
+    # Unit tests plus the live tests against a disposable InvoiceNinja
+    # (run-tests.sh starts the docker-compose stack and mints a dev token).
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: app
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
-      - run: uv sync --locked
-      - run: uv run pytest -q
+      - run: ./run-tests.sh -q
 
   publish:
     needs: test

@@ -1,6 +1,6 @@
 import asyncio
 
-import httpx
+import httpx2
 import pytest
 from fastmcp import Client
 
@@ -10,30 +10,30 @@ PDF = b"%PDF-1.4 receipt"
 SHARE_URL = "https://paperless.example.com/share/abc"
 
 
-def _clients(captured: dict) -> tuple[httpx.AsyncClient, httpx.AsyncClient]:
+def _clients(captured: dict) -> tuple[httpx2.AsyncClient, httpx2.AsyncClient]:
     """InvoiceNinja client recording the upload, and a fetcher serving the PDF."""
-    def invoiceninja(request: httpx.Request) -> httpx.Response:
+    def invoiceninja(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == "/api/v1/expenses/exp123/upload" and request.method == "POST":
             captured["body"] = request.content
             captured["token"] = request.headers.get("x-api-token")
-            return httpx.Response(200, json={"data": {"id": "exp123"}})
-        return httpx.Response(404, json={"message": "not found"})
+            return httpx2.Response(200, json={"data": {"id": "exp123"}})
+        return httpx2.Response(404, json={"message": "not found"})
 
-    def download(request: httpx.Request) -> httpx.Response:
+    def download(request: httpx2.Request) -> httpx2.Response:
         captured["fetch_headers"] = dict(request.headers)
         if str(request.url) == SHARE_URL:
-            return httpx.Response(200, content=PDF, headers={
+            return httpx2.Response(200, content=PDF, headers={
                 "content-type": "application/pdf",
                 "content-disposition": 'attachment; filename="Rechnung 42.pdf"',
             })
         if request.url.path == "/share/redirect":
-            return httpx.Response(302, headers={"location": "http://169.254.169.254/"})
-        return httpx.Response(404)
+            return httpx2.Response(302, headers={"location": "http://169.254.169.254/"})
+        return httpx2.Response(404)
 
     return (
-        httpx.AsyncClient(base_url="http://invoiceninja:80", auth=server.InvoiceNinjaTokenAuth(),
-                          transport=httpx.MockTransport(invoiceninja)),
-        httpx.AsyncClient(transport=httpx.MockTransport(download)),
+        httpx2.AsyncClient(base_url="http://invoiceninja:80", auth=server.InvoiceNinjaTokenAuth(),
+                          transport=httpx2.MockTransport(invoiceninja)),
+        httpx2.AsyncClient(transport=httpx2.MockTransport(download)),
     )
 
 
