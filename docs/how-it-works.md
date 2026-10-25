@@ -23,11 +23,11 @@ sequenceDiagram
 ```
 
 1. `TokenCaptureMiddleware` (pure ASGI) requires `Authorization` on the MCP path and stashes it in a contextvar.
-2. `InvoiceNinjaTokenAuth` (an `httpx.Auth`) reads it on the outgoing call, strips a leading `Bearer `, and sets `X-API-TOKEN`, plus the fixed `X-Requested-With` header Invoice Ninja's docs require.
+2. `InvoiceNinjaTokenAuth` (an `httpx2.Auth`) reads it on the outgoing call, strips a leading `Bearer `, and sets `X-API-TOKEN`, plus the fixed `X-Requested-With` header Invoice Ninja's docs require.
 
 ## OAuth
 
-In `oauth` and `both` modes the server is also an authorization server (the MCP SDK's `OAuthProvider`, subclassed as `InvoiceNinjaOAuthProvider`) with an encrypted file store under `/data/oauth`.
+In `oauth` and `both` modes the server is also an authorization server, provided by the shared library [mcp-login-oauth](https://github.com/Marceltov/mcp-login-oauth), with an encrypted file store under `/data/oauth`. This server supplies the login check and the token clean-up; the library supplies the rest, including revocation for public clients such as claude.ai, a short delay after each failed login and login links that end after 5 failures.
 
 ```mermaid
 sequenceDiagram
@@ -58,4 +58,4 @@ sequenceDiagram
 3. The redirect carries the authorization code and `iss`. The client exchanges the code (PKCE) for an `inmcp_` access token and a refresh token.
 4. On a tool call the server maps the access token to the minted Invoice Ninja token and sends it as `X-API-TOKEN`.
 
-`resolve_auth_mode()` picks `token`, `oauth` or `both` from the environment, and `wrap_app()` assembles the ASGI stack for it. In both `oauth` and `both`, `IssuerFlagMiddleware` advertises `iss` support in the metadata and `UploadAuthMiddleware` gates the plain-HTTP `/upload/{entity}/{id}` route with the same bearer. Only in `both` does `BearerPrefixMiddleware` add `Bearer ` to raw tokens so FastMCP can parse them.
+`resolve_auth_mode()` picks `token`, `oauth` or `both` from the environment, and `wrap_app()` assembles the ASGI stack for it. In both `oauth` and `both`, `UploadAuthMiddleware` gates the plain-HTTP `/upload/{entity}/{id}` route with the same bearer. Only in `both` does `BearerPrefixMiddleware` add `Bearer ` to raw tokens so FastMCP can parse them.

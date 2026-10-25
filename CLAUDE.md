@@ -38,6 +38,10 @@ docker compose down -v && docker compose up -d --wait
 
 The image is built and pushed to GHCR by `.github/workflows/publish.yml`: every branch push produces a testable image tagged `:<branch>`, and a `v*` tag produces the versioned release plus a GitHub release. `cleanup-packages.yml` weekly prunes orphaned untagged manifests.
 
+## Testing on the Trilium host
+
+On the CT that runs production Trilium, ports 8081/8082 belong to two production Trilium instances, so `run-tests.sh` can't bind them there, and a bare `uv run pytest` would point the live tests at production Trilium. Run the stack there without host ports, with pytest in the MCP container's network namespace.
+
 ## Test layout
 
 Two kinds of tests, both under `app/tests/`:
@@ -59,11 +63,11 @@ Two kinds of tests, both under `app/tests/`:
 In token mode the server holds no secret. The API token travels per-request through a contextvar:
 
 1. `TokenCaptureMiddleware` (pure-ASGI) requires an `Authorization` header on the MCP path, rejecting requests without one as `401` before FastMCP sees them. `/health` is always allowed through unauthenticated.
-2. `InvoiceNinjaTokenAuth` (an `httpx.Auth`) reads the contextvar on the outgoing InvoiceNinja call, strips a leading `Bearer ` if present, and sets it as `X-API-TOKEN`. It also sets a fixed `X-Requested-With: XMLHttpRequest` header, which InvoiceNinja's API docs describe as required.
+2. `InvoiceNinjaTokenAuth` (an `httpx2.Auth`; FastMCP 4's OpenAPI provider deprecates plain `httpx`, so the server uses `httpx2` throughout) reads the contextvar on the outgoing InvoiceNinja call, strips a leading `Bearer ` if present, and sets it as `X-API-TOKEN`. It also sets a fixed `X-Requested-With: XMLHttpRequest` header, which InvoiceNinja's API docs describe as required.
 
 ### OAuth
 
-`InvoiceNinjaOAuthProvider` (subclass of the MCP SDK `OAuthProvider`) serves discovery, DCR, `/authorize`, `/token` (PKCE), `/revoke`, plus its own `/login` form. `/login` posts email, password and optional 2FA code to InvoiceNinja `/api/v1/login`, then mints a token named `MCP: <client>` via `/api/v1/tokens` with the session token. It **never** calls `/logout` (that deletes the user's shared "User Token"). Registrations and tokens live in a Fernet-encrypted store at `/data/oauth` keyed by `MCP_OAUTH_SECRET`; OAuth bearers carry the `inmcp_` prefix. `resolve_auth_mode()` picks `token|oauth|both` (unset means `both` when `MCP_BASE_URL` and `MCP_OAUTH_SECRET` are set, else `token`) and `wrap_app()` builds the ASGI stack: in both `oauth` and `both`, `UploadAuthMiddleware` gates `/upload/{entity}/{id}` and `IssuerFlagMiddleware` advertises `iss`; only `both` adds `BearerPrefixMiddleware`, which lets raw tokens through. Revoke drops the OAuth pair and best-effort `DELETE /api/v1/tokens/{id}`, which only archives the token. Tests: `app/tests/test_oauth.py` and `app/tests/live/test_oauth_flow.py`. 2FA and passkey/SSO logins are untested; CIMD is unsupported (DCR only). See ADR 0003.
+`build_oauth_provider` returns a `LoginOAuthProvider` from the shared library [mcp-login-oauth](https://github.com/Marceltov/mcp-login-oauth) (pinned by git tag, so the Dockerfile's builder installs git; ADR 0004). The library serves discovery, DCR, `/authorize`, `/token` (PKCE), `/revoke` (public clients too), the `/login` form, `iss` on the redirect and RFC 8707 resource binding. This server supplies `check_login(form, client)`: it posts email, password and optional 2FA code to InvoiceNinja `/api/v1/login`, then mints a token named `MCP: <client name>` via `/api/v1/tokens` with the session token; `{"api_token", "token_id"}` is the grant, read from `get_access_token().claims["grant"]`. It **never** calls `/logout` (that deletes the user's shared "User Token"). Registrations and tokens live in the library's Fernet-encrypted store at `/data/oauth` keyed by `MCP_OAUTH_SECRET` (salt `OAUTH_STORE_SALT`); OAuth bearers carry the `inmcp_` prefix. `resolve_auth_mode()` picks `token|oauth|both` (unset means `both` when `MCP_BASE_URL` and `MCP_OAUTH_SECRET` are set, else `token`) and `wrap_app()` builds the ASGI stack: in both `oauth` and `both`, `UploadAuthMiddleware` gates `/upload/{entity}/{id}` (custom routes sit outside FastMCP's auth); only `both` adds the library's `BearerPrefixMiddleware` and `verify_static`, which let raw tokens through. Revoke (`on_revoke`) drops the OAuth pair and best-effort `DELETE /api/v1/tokens/{id}`, which only archives the token; an archived token gets 403. Tests: `app/tests/test_oauth.py` and `app/tests/live/test_oauth_flow.py`. 2FA and passkey/SSO logins are untested; CIMD is unsupported (DCR only). See ADR 0003.
 
 ### Startup resilience
 

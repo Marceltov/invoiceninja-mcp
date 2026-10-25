@@ -1,46 +1,46 @@
 import asyncio
 import base64
 
-import httpx
+import httpx2
 
 import server
 
 
-def _mock_client() -> httpx.AsyncClient:
-    """An httpx client whose transport fakes InvoiceNinja's client-list response.
+def _mock_client() -> httpx2.AsyncClient:
+    """An httpx2 client whose transport fakes InvoiceNinja's client-list response.
 
     base_url is the bare server root (no /api/v1 suffix): the spec's own path
-    keys already include /api/v1 (e.g. "/api/v1/clients"), and httpx's
+    keys already include /api/v1 (e.g. "/api/v1/clients"), and httpx2's
     base_url + relative-path concatenation would double it up if we appended
     /api/v1 here too. The handler asserts the exact path for this reason --
     an endswith("/clients") check would still match a doubled
     "/api/v1/api/v1/clients" and silently hide that bug.
     """
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == "/api/v1/clients" and request.method == "GET":
-            return httpx.Response(200, json={"data": [], "meta": {"pagination": {}}})
-        return httpx.Response(404, json={"message": "not found"})
+            return httpx2.Response(200, json={"data": [], "meta": {"pagination": {}}})
+        return httpx2.Response(404, json={"message": "not found"})
 
-    return httpx.AsyncClient(
+    return httpx2.AsyncClient(
         base_url="http://invoiceninja:80",
         auth=server.InvoiceNinjaTokenAuth(),
-        transport=httpx.MockTransport(handler),
+        transport=httpx2.MockTransport(handler),
     )
 
 
-def _upload_capture_client(captured: dict) -> httpx.AsyncClient:
+def _upload_capture_client(captured: dict) -> httpx2.AsyncClient:
     """Client whose transport records the multipart upload request."""
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == "/api/v1/clients/abc123/upload":
             captured["content_type"] = request.headers.get("content-type")
             captured["body"] = request.content
-            return httpx.Response(200, json={"data": {"id": "abc123"}})
-        return httpx.Response(404, json={"message": "not found"})
+            return httpx2.Response(200, json={"data": {"id": "abc123"}})
+        return httpx2.Response(404, json={"message": "not found"})
 
-    return httpx.AsyncClient(
+    return httpx2.AsyncClient(
         base_url="http://invoiceninja:80",
         auth=server.InvoiceNinjaTokenAuth(),
-        transport=httpx.MockTransport(handler),
+        transport=httpx2.MockTransport(handler),
     )
 
 
@@ -229,13 +229,13 @@ def test_responses_that_deviate_from_spec_schema_are_not_rejected():
     # "Structured content does not match the tool's output schema".
     from fastmcp import Client
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": [{"id": "abc", "country_id": "276"}]})
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"data": [{"id": "abc", "country_id": "276"}]})
 
-    client = httpx.AsyncClient(
+    client = httpx2.AsyncClient(
         base_url="http://invoiceninja:80",
         auth=server.InvoiceNinjaTokenAuth(),
-        transport=httpx.MockTransport(handler),
+        transport=httpx2.MockTransport(handler),
     )
 
     async def run():
@@ -275,10 +275,10 @@ def test_request_bodies_require_nothing():
 def _api_request(handler, args):
     from fastmcp import Client
 
-    client = httpx.AsyncClient(
+    client = httpx2.AsyncClient(
         base_url="http://invoiceninja:80",
         auth=server.InvoiceNinjaTokenAuth(),
-        transport=httpx.MockTransport(handler),
+        transport=httpx2.MockTransport(handler),
     )
 
     async def run():
@@ -295,11 +295,11 @@ def _api_request(handler, args):
 def test_api_request_forwards_raw_call_and_returns_status_and_body():
     seen = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen.update(method=request.method, path=request.url.path,
                     query=dict(request.url.params), body=request.content,
                     token=request.headers.get("X-API-TOKEN"))
-        return httpx.Response(422, json={"message": "invalid", "errors": {}})
+        return httpx2.Response(422, json={"message": "invalid", "errors": {}})
 
     result = _api_request(handler, {
         "method": "PUT", "path": "/api/v1/quotes/abc",
@@ -314,7 +314,7 @@ def test_api_request_forwards_raw_call_and_returns_status_and_body():
 
 
 def test_api_request_only_reaches_the_api():
-    result = _api_request(lambda r: httpx.Response(200), {
+    result = _api_request(lambda r: httpx2.Response(200), {
         "method": "GET", "path": "/../admin",
     })
     assert result.is_error
@@ -323,8 +323,8 @@ def test_api_request_only_reaches_the_api():
 def test_api_request_returns_binary_responses_as_an_embedded_file():
     pdf = b"%PDF-1.7 fake quote"
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=pdf, headers={
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, content=pdf, headers={
             "content-type": "application/pdf",
             "content-disposition": 'attachment; filename="3D-2026-0001.pdf"',
         })
@@ -341,7 +341,7 @@ def test_api_request_returns_binary_responses_as_an_embedded_file():
 
 
 def test_api_request_still_returns_text_and_json_as_data():
-    result = _api_request(lambda r: httpx.Response(200, text="pong"),
+    result = _api_request(lambda r: httpx2.Response(200, text="pong"),
                           {"method": "GET", "path": "/api/v1/ping"})
     assert result.structured_content == {"status": 200, "body": "pong"}
 
@@ -351,16 +351,16 @@ def test_upload_route_forwards_file_as_spoofed_put():
 
     captured: dict = {}
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == "/api/v1/expenses/exp123/upload":
             captured["body"] = request.content
-            return httpx.Response(200, json={"data": {"id": "exp123"}})
-        return httpx.Response(404, json={"message": "not found"})
+            return httpx2.Response(200, json={"data": {"id": "exp123"}})
+        return httpx2.Response(404, json={"message": "not found"})
 
-    mock = httpx.AsyncClient(
+    mock = httpx2.AsyncClient(
         base_url="http://invoiceninja:80",
         auth=server.InvoiceNinjaTokenAuth(),
-        transport=httpx.MockTransport(handler),
+        transport=httpx2.MockTransport(handler),
     )
     app = server.TokenCaptureMiddleware(server.build_server(client=mock).http_app())
     http = TestClient(app)
