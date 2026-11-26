@@ -36,7 +36,7 @@ python3 scripts/mint_dev_token.py   # mint invoiceninja.token
 docker compose down -v && docker compose up -d --wait
 ```
 
-The image is built and pushed to GHCR by `.github/workflows/publish.yml`: every branch push produces a testable image tagged `:<branch>`, and a `v*` tag produces the versioned release plus a GitHub release. `cleanup-packages.yml` weekly prunes orphaned untagged manifests.
+The image is built and pushed to GHCR by `.github/workflows/publish.yml`: every branch push produces a testable image tagged `:<branch>`, and a `v*` tag produces the versioned release plus a GitHub release. No package cleanup: in a multi-arch image the per-platform manifests are untagged versions, and deleting untagged versions broke every release (MarcelBruckner-Homelab/homelab#720).
 
 ## Testing on the Trilium host
 
